@@ -26,11 +26,11 @@
   <worldbody>
     <light directional="true" pos="0 0 3" dir="0 0 -1"/>
     <geom name="floor" type="plane" size="5 5 0.1" material="grid_mat"/>
-    <geom name="rail" type="capsule" fromto="-1.5 0 0.5 1.5 0 0.5" size="0.015" material="rail_mat"/>
+    <geom name="rail" type="capsule" fromto="-2.6 0 0.5 2.6 0 0.5" size="0.015" material="rail_mat"/>
     
     <!-- Cart -->
     <body name="cart" pos="0 0 0.5">
-      <joint name="slider" type="slide" axis="1 0 0" limited="true" range="-1.2 1.2" damping="0.5"/>
+      <joint name="slider" type="slide" axis="1 0 0" limited="true" range="-2.2 2.2" damping="0.5"/>
       <geom name="cart_geom" type="box" size="0.15 0.08 0.05" material="cart_mat" mass="1.2"/>
       
       <!-- Pendulum 1 -->
@@ -50,8 +50,9 @@
   </worldbody>
   
   <actuator>
-    <motor name="cart_motor" joint="slider" gear="1" ctrllimited="true" ctrlrange="-25.0 25.0"/>
+    <motor name="cart_motor" joint="slider" gear="1" ctrllimited="true" ctrlrange="-60.0 60.0"/>
   </actuator>
+
   
   <sensor>
     <jointpos name="cart_pos" joint="slider"/>
