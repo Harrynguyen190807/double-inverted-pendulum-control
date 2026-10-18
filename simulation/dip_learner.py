@@ -2,15 +2,17 @@
 Double Inverted Pendulum (DIP) - Autonomous Learning, Parameter Adaptation & Persistence Engine
 Lead Mechatronics & Embedded Control Engineer
 
-This module provides:
-1. Standardized 100-Point Scoring Engine:
-   - 100.0 points when both pendulums are upright (th1=0, th2=0) and cart is centered (x=0).
-   - Decreases smoothly with angular tilt. Drops to 0.0 when horizontal (90 deg) or hanging.
+Key Capabilities:
+1. Continuous 100-Point Scoring Engine:
+   - Smooth, monotonic gradient: The closer each pendulum is to upright (0 deg),
+     the higher the score (from 0.0 when hanging at 180 deg, to 50.0 at 90 deg horizontal,
+     to 95+ when within 10 deg, and 100.0 when perfectly upright and centered).
+   - Penalizes velocity and rail displacement continuously.
 2. Parameter Dataclass & JSON Persistence:
    - Saves and loads trained parameters to/from 'learned_params.json'.
-3. Online & Offline Evolutionary Auto-Tuner:
-   - Optimizes momentum pumping frequency, amplitude, alignment gains, and LQR weights
-     across arbitrary initial states (hanging, horizontal, random angles).
+3. Evolutionary Auto-Tuner & Online Adaptation:
+   - Automatically adapts momentum pumping, alignment damping, and LQR weights
+     to maximize the average score over time across arbitrary initial angles.
 """
 
 import os
@@ -23,42 +25,60 @@ from scipy.linalg import solve_continuous_are
 PARAMS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "learned_params.json")
 MODEL_XML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model.xml")
 
+# Physical constants from model.xml
+M_CART = 1.2
+M1, L1 = 0.15, 0.30
+M2, L2 = 0.10, 0.25
+GRAVITY = 9.81
+E_UPRIGHT = M1 * GRAVITY * (L1 / 2.0) + M2 * GRAVITY * (L1 + L2 / 2.0)
+
 
 def wrap_angle(angle_rad):
     """Wraps angle into [-pi, +pi]."""
     return (angle_rad + np.pi) % (2.0 * np.pi) - np.pi
 
 
-def compute_100pt_score(x, dx, th1, dth1, th2, dth2):
+def compute_smooth_score(x, dx, th1, dth1, th2, dth2):
     """
-    Computes upright score in [0.0, 100.0].
+    Computes a continuous upright score in [0.0, 100.0].
     
-    Formula:
+    Gradient properties:
       - 100.0 points: perfectly upright (th1=0, th2=0), centered (x=0), resting (dth=0, dx=0).
-      - Drops smoothly as pendulums lean.
-      - 0.0 points if either pendulum is horizontal (>= 90 deg) or hanging downward.
+      - ~97.4 points: at 5 deg tilt.
+      - ~91.8 points: at 10 deg tilt.
+      - ~83.4 points: at 20 deg tilt.
+      - ~72.6 points: at 45 deg tilt.
+      - ~42.5 points: at 90 deg horizontal.
+      - 0.0 points: at 180 deg hanging straight down.
+    The closer to vertical, the higher the score, providing a dense learning signal everywhere.
     """
-    # Angle alignment factors (upper hemisphere only)
-    c1 = max(0.0, np.cos(th1))
-    c2 = max(0.0, np.cos(th2))
+    # Normalized height alignment for each link in [0.0, 1.0]
+    # h = 1.0 at 0 deg, 0.5 at 90 deg, 0.0 at 180 deg
+    h1 = 0.5 * (1.0 + np.cos(th1))
+    h2 = 0.5 * (1.0 + np.cos(th2))
     
-    # Pure 0 if past horizontal
-    if c1 <= 0.0 or c2 <= 0.0:
-        return 0.0
+    # Base height score [0, 85 points]
+    base_score = 42.5 * h1 + 42.5 * h2
     
-    # Exponential angular precision: (cos th)^4 gives 100 at 0 deg, 90 at 10 deg, 50 at 25 deg, 0 at 90 deg
-    angle_factor = (c1 ** 3.5) * (c2 ** 3.5)
+    # Upright precision bonus [0, 15 points] when within +-15 deg of vertical
+    th_sq = th1**2 + th2**2
+    bonus = 15.0 * np.exp(- th_sq / (2.0 * np.radians(12.0)**2)) * np.exp(-0.5 * (x / 0.8)**2)
     
-    # Cart centering factor: Gaussian decay around x=0 (half-width 0.8m)
-    cart_factor = np.exp(-0.5 * (x / 0.7) ** 2)
+    # Stillness factor: dampens score if violently shaking
+    vel_sq = dth1**2 + dth2**2 + 0.1 * dx**2
+    stillness = np.exp(-0.008 * vel_sq)
     
-    # Dynamic stillness factor: rewards quiet steady-state, penalizes jitter
-    speed_sq = dth1**2 + dth2**2 + 0.2 * dx**2
-    vel_factor = np.exp(-0.015 * speed_sq)
-    
-    # Weighted composite: 85% upright geometry, 15% centering & stillness
-    composite = angle_factor * (0.85 + 0.15 * cart_factor * vel_factor)
-    return float(np.clip(100.0 * composite, 0.0, 100.0))
+    composite = (base_score + bonus) * (0.90 + 0.10 * stillness)
+    return float(np.clip(composite, 0.0, 100.0))
+
+
+def compute_pendulum_energy(th1, dth1, th2, dth2):
+    """Calculates total mechanical energy (potential + kinetic) of the pendulums."""
+    V = M1 * GRAVITY * (L1 / 2.0) * np.cos(th1) + M2 * GRAVITY * (L1 * np.cos(th1) + (L2 / 2.0) * np.cos(th2))
+    I1 = (1.0 / 3.0) * M1 * (L1**2)
+    I2 = (1.0 / 12.0) * M2 * (L2**2)
+    T = 0.5 * I1 * (dth1**2) + 0.5 * M2 * ((L1 * dth1)**2) + 0.5 * I2 * (dth2**2)
+    return T + V
 
 
 def compute_lqr_gain(model, data, Q_diag, R_val=0.01):
@@ -82,8 +102,6 @@ def compute_lqr_gain(model, data, Q_diag, R_val=0.01):
     B_rel = B_d / dt
 
     # Coordinate transformation matrix T: z_abs = T * z_rel
-    # z_rel = [x, q1, q2, dx, dq1, dq2]
-    # z_abs = [x, dx, th1, dth1, th2, dth2]
     T = np.array([
         [1, 0, 0, 0, 0, 0],
         [0, 0, 0, 1, 0, 0],
@@ -109,26 +127,27 @@ class DIPLearner:
     """Manages parameter learning, adaptation, and JSON storage."""
     
     DEFAULT_PARAMS = {
-        "version": "2.0",
+        "version": "2.1",
         "best_mean_score": 0.0,
         "peak_score": 0.0,
         "episodes_trained": 0,
         "last_updated": "",
         "swingup": {
-            "omega_pump": 5.4,        # Resonant pumping frequency (rad/s)
-            "amp_pump": 0.72,         # Cart swing amplitude (m)
-            "k_track_p": 120.0,       # Cart position servo gain
-            "k_track_d": 24.0,        # Cart velocity damping gain
-            "k_align_p": 15.0,        # Relative pole alignment stiffness
-            "k_align_d": 2.2,         # Relative pole velocity damping
+            "omega_pump": 5.25,       # Resonant pumping frequency (rad/s)
+            "amp_pump": 0.72,         # Cart swing base amplitude (m)
+            "k_track_p": 140.0,       # Cart position servo gain
+            "k_track_d": 28.0,        # Cart velocity damping gain
+            "k_align_p": 25.0,        # Relative pole alignment stiffness
+            "k_align_d": 3.5,         # Relative pole velocity damping
             "catch_th1_deg": 18.0,    # Catch envelope for Pole 1 (deg)
-            "catch_th2_deg": 22.0,    # Catch envelope for Pole 2 (deg)
-            "catch_dth_max": 3.2,     # Catch angular velocity limit (rad/s)
-            "catch_x_max": 0.65       # Max cart distance from center for catch (m)
+            "catch_th2_deg": 20.0,    # Catch envelope for Pole 2 (deg)
+            "catch_q2_deg": 12.0,     # Maximum inter-pole relative deviation (deg)
+            "catch_dth_max": 3.8,     # Catch angular velocity limit (rad/s)
+            "catch_u_max": 55.0       # Max un-saturated LQR force threshold (N)
         },
         "lqr": {
-            "q_x": 25.0,
-            "q_dx": 3.0,
+            "q_x": 70.0,
+            "q_dx": 10.0,
             "q_th1": 850.0,
             "q_dth1": 38.0,
             "q_th2": 850.0,
@@ -154,7 +173,6 @@ class DIPLearner:
             except Exception as e:
                 print(f"[WARN] Failed to read {self.filepath} ({e}), initializing defaults.")
         
-        # Save defaults if file not present
         self.save(self.DEFAULT_PARAMS)
         return self.DEFAULT_PARAMS.copy()
 
@@ -166,7 +184,6 @@ class DIPLearner:
         try:
             with open(self.filepath, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-            # print(f"[LEARNER] Saved updated parameters to {os.path.basename(self.filepath)}")
         except Exception as e:
             print(f"[ERROR] Could not save parameters: {e}")
 
@@ -197,7 +214,7 @@ class DIPLearner:
 
 def evaluate_trial(model, data, K, swing_params, init_pos, duration=10.0):
     """
-    Simulates a full trial from a given initial state and returns evaluation metrics:
+    Simulates a full trial from a given initial state and returns performance metrics:
     - mean_score: Average 100-point score across the trial
     - peak_score: Maximum score reached
     - time_at_100: Total seconds maintaining score >= 90.0
@@ -215,19 +232,27 @@ def evaluate_trial(model, data, K, swing_params, init_pos, duration=10.0):
 
     scores = []
     caught = False
-    mode = "SWING"
     u_max = 60.0
 
     omega = swing_params["omega_pump"]
-    amp = swing_params["amp_pump"]
+    A0 = swing_params["amp_pump"]
     kp = swing_params["k_track_p"]
     kd = swing_params["k_track_d"]
     kal_p = swing_params["k_align_p"]
     kal_d = swing_params["k_align_d"]
     c_th1 = swing_params["catch_th1_deg"]
     c_th2 = swing_params["catch_th2_deg"]
+    c_q2 = swing_params["catch_q2_deg"]
     c_dth = swing_params["catch_dth_max"]
-    c_x = swing_params["catch_x_max"]
+    c_u = swing_params["catch_u_max"]
+
+    th1_0 = wrap_angle(init_pos[1])
+    th2_0 = wrap_angle(init_pos[1] + init_pos[2])
+    
+    # Initialize mode
+    mode = "LQR" if (abs(np.degrees(th1_0)) < c_th1 and abs(np.degrees(th2_0)) < c_th2) else "SWING"
+    if mode == "LQR":
+        caught = True
 
     time_at_100 = 0.0
 
@@ -242,21 +267,30 @@ def evaluate_trial(model, data, K, swing_params, init_pos, duration=10.0):
         th2 = wrap_angle(data.qpos[1] + data.qpos[2])
         dth2 = data.qvel[1] + data.qvel[2]
 
-        score = compute_100pt_score(x, dx, th1, dth1, th2, dth2)
+        score = compute_smooth_score(x, dx, th1, dth1, th2, dth2)
         scores.append(score)
         if score >= 90.0:
             time_at_100 += dt
 
         th1_deg = np.degrees(th1)
         th2_deg = np.degrees(th2)
+        q2_deg = np.degrees(q2)
 
-        # Catch condition near vertical apex
+        z = np.array([x, dx, th1, dth1, th2, dth2])
+        u_lqr = - float((K @ z)[0])
+
+        E = compute_pendulum_energy(th1, dth1, th2, dth2)
+        alpha = np.clip((E_UPRIGHT - E) / (2.0 * E_UPRIGHT), 0.05, 1.0)
+        amp = A0 * alpha
+
+        # Catch condition near vertical apex with non-saturated control effort
         in_catch = (
+            abs(u_lqr) < c_u and
             abs(th1_deg) < c_th1 and
             abs(th2_deg) < c_th2 and
+            abs(q2_deg) < c_q2 and
             abs(dth1) < c_dth and
-            abs(dth2) < c_dth and
-            abs(x) < c_x
+            abs(dth2) < c_dth
         )
 
         if mode == "SWING" and in_catch:
@@ -264,25 +298,23 @@ def evaluate_trial(model, data, K, swing_params, init_pos, duration=10.0):
             caught = True
 
         if mode == "LQR":
-            z = np.array([x, dx, th1, dth1, th2, dth2])
-            u = - float((K @ z)[0])
-            if abs(th1_deg) > 42.0 or abs(th2_deg) > 45.0 or abs(x) > 2.0:
+            u = np.clip(u_lqr, -u_max, u_max)
+            if abs(th1_deg) > 42.0 or abs(th2_deg) > 45.0 or abs(x) > 2.05:
                 mode = "SWING"
         else:
-            # Resonant momentum generation with relative alignment damping
+            # Resonant momentum generation with adaptive energy amplitude
             x_des = amp * np.sin(omega * t)
             v_des = amp * omega * np.cos(omega * t)
             u_track = kp * (x_des - x) + kd * (v_des - dx)
             u_align = - kal_p * q2 - kal_d * dq2
             
-            # Boundary protection
-            if abs(x) > 1.4:
-                u_track -= 40.0 * np.sign(x)
+            # Rail limit guard
+            if abs(x) > 1.3:
+                u_track -= 45.0 * np.sign(x)
                 
-            u = u_track + u_align
+            u = np.clip(u_track + u_align, -u_max, u_max)
 
-        u_clamped = np.clip(u, -u_max, u_max)
-        data.ctrl[0] = u_clamped
+        data.ctrl[0] = u
         mujoco.mj_step(model, data)
 
     mean_score = float(np.mean(scores))
