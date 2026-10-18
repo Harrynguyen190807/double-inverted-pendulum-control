@@ -169,6 +169,8 @@ def main():
     scores_history = []
     peak_score = 0.0
     time_at_100 = 0.0
+    current_streak = 0.0
+    max_streak = 0.0
     recovery_count = 0
     next_impulse_time = 8.0 if args.impulse else 1e9
 
@@ -209,6 +211,14 @@ def main():
 
             if score >= 90.0:
                 time_at_100 += dt
+
+            # Consecutive 99+ Hold Streak tracking
+            if score >= 99.0:
+                current_streak += dt
+                if current_streak > max_streak:
+                    max_streak = current_streak
+            else:
+                current_streak = 0.0
 
             # Compute LQR control effort
             z = np.array([x, dx, th1, dth1, th2, dth2])
@@ -276,11 +286,12 @@ def main():
             if time.time() - last_hud_time > 0.3:
                 mean_score = np.mean(scores_history)
                 duty_cycle = 100.0 * (time_at_100 / max(0.001, elapsed))
-                bar = render_score_bar(score, width=18)
+                bar = render_score_bar(score, width=16)
                 
                 sys.stdout.write(
-                    f"\r{bar} Score:{score:5.1f} | Mean:{mean_score:5.1f} | Peak:{peak_score:5.1f} | "
-                    f"[{mode[:11]:11s}] | 100Pt-Hold:{duty_cycle:4.1f}% | "
+                    f"\r{bar} Score:{score:5.1f} | Mean:{mean_score:5.1f} | "
+                    f"Streak:{current_streak:4.1f}s(Max:{max_streak:4.1f}s) | "
+                    f"[{mode[:7]:7s}] | Hold:{duty_cycle:4.1f}% | "
                     f"Recov:{recovery_count:2d} | u:{u_clamped:+5.1f}N | x:{x:+5.2f}m"
                 )
                 sys.stdout.flush()
@@ -301,6 +312,7 @@ def main():
     duty_final = 100.0 * (time_at_100 / max(0.001, time.time() - session_start))
     print(f"Final Performance: Cumulative Mean Score: {mean_final:.1f} / 100.0")
     print(f"                   Peak Score:            {peak_score:.1f} / 100.0")
+    print(f"                   Max Hold Streak:       {max_streak:.1f} s")
     print(f"                   100-Point Hold Time:   {time_at_100:.1f}s ({duty_final:.1f}%) | Total Recoveries: {recovery_count}")
     if not args.no_learn:
         learner.update_score_stats(mean_final, peak_score)

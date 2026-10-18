@@ -255,6 +255,11 @@ def evaluate_trial(model, data, K, swing_params, init_pos, duration=10.0):
         caught = True
 
     time_at_100 = 0.0
+    current_streak = 0.0
+    max_streak = 0.0
+    cumulative_streak_reward = 0.0
+    total_drift_penalty = 0.0
+    total_micro_osc_penalty = 0.0
 
     for step in range(total_steps):
         t = step * dt
@@ -269,12 +274,32 @@ def evaluate_trial(model, data, K, swing_params, init_pos, duration=10.0):
 
         score = compute_smooth_score(x, dx, th1, dth1, th2, dth2)
         scores.append(score)
-        if score >= 90.0:
+        
+        # 1. Consecutive Hold Reward: Score >= 99.0 indicates near-perfect vertical balance
+        if score >= 99.0:
             time_at_100 += dt
+            current_streak += dt
+            if current_streak > max_streak:
+                max_streak = current_streak
+            # Progressive streak reward: rewards holding unbroken continuous equilibrium
+            cumulative_streak_reward += current_streak * dt
+        else:
+            # Reset streak if balance breaks below perfect threshold
+            current_streak = 0.0
+
+        # 2. Cart Drift Penalty: heavily penalizes cart drifting away from track center (x = 0)
+        cart_drift = (x / 0.6)**2 + 0.15 * (dx / 0.8)**2
+        if abs(x) > 1.0:
+            cart_drift += 10.0 * (abs(x) - 1.0)
+        total_drift_penalty += cart_drift * dt
 
         th1_deg = np.degrees(th1)
         th2_deg = np.degrees(th2)
         q2_deg = np.degrees(q2)
+
+        # 3. Micro-Oscillation Penalty: suppress high-frequency angular jitter when near vertical
+        if abs(th1_deg) < 15.0 and abs(th2_deg) < 15.0:
+            total_micro_osc_penalty += (dth1**2 + dth2**2) * dt
 
         z = np.array([x, dx, th1, dth1, th2, dth2])
         u_lqr = - float((K @ z)[0])
@@ -323,6 +348,10 @@ def evaluate_trial(model, data, K, swing_params, init_pos, duration=10.0):
         "mean_score": mean_score,
         "peak_score": peak_score,
         "time_at_100": time_at_100,
+        "max_streak": max_streak,
+        "streak_reward": cumulative_streak_reward,
+        "drift_penalty": total_drift_penalty,
+        "micro_osc_penalty": total_micro_osc_penalty,
         "caught": caught,
         "final_score": scores[-1]
     }
