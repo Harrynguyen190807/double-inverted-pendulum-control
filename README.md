@@ -102,23 +102,24 @@ $$u(t) = -\mathbf{K}\mathbf{z}(t)$$
 
 ## 3. Physical Benchmark Parameters
 
-| Symbol | Parameter Description | Nominal Value | SI Unit |
-| :--- | :--- | :--- | :--- |
-| $M$ | Cart Mass | 1.20 | $\text{kg}$ |
-| $m_1$ | Pendulum 1 Mass | 0.15 | $\text{kg}$ |
-| $m_2$ | Pendulum 2 Mass | 0.10 | $\text{kg}$ |
-| $L_1$ | Pendulum 1 Total Length | 0.30 | $\text{m}$ |
-| $L_2$ | Pendulum 2 Total Length | 0.25 | $\text{m}$ |
-| $l_1$ | Center of Mass Distance (Link 1) | 0.15 | $\text{m}$ |
-| $l_2$ | Center of Mass Distance (Link 2) | 0.125 | $\text{m}$ |
-| $J_1$ | Mass Moment of Inertia (Link 1) | $1.125 \times 10^{-3}$ | $\text{kg}\cdot\text{m}^2$ |
-| $J_2$ | Mass Moment of Inertia (Link 2) | $5.208 \times 10^{-4}$ | $\text{kg}\cdot\text{m}^2$ |
-| $g$ | Gravitational Acceleration | 9.81 | $\text{m/s}^2$ |
-| $b$ | Cart Track Viscous Friction | 0.50 | $\text{N}\cdot\text{s/m}$ |
-| $d_1$ | Joint 1 Viscous Damping | 0.005 | $\text{N}\cdot\text{m}\cdot\text{s/rad}$ |
-| $d_2$ | Joint 2 Viscous Damping | 0.003 | $\text{N}\cdot\text{m}\cdot\text{s/rad}$ |
-| $u_{\max}$ | Actuator Force Saturation Limit | 25.0 | $\text{N}$ |
-| $f_{isr}$ | Real-Time Hardware Timer Interrupt Frequency | 1000 | $\text{Hz}$ |
+| Parameter | Symbol | Nominal Value | SI Unit | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| Cart Mass | M | 1.20 | kg | Mass of motorized linear cart |
+| Link 1 Mass | m1 | 0.15 | kg | Mass of lower pendulum rod |
+| Link 2 Mass | m2 | 0.10 | kg | Mass of upper pendulum rod |
+| Link 1 Length | L1 | 0.30 | m | Total length of lower rod |
+| Link 2 Length | L2 | 0.25 | m | Total length of upper rod |
+| Link 1 COM Distance | l1 | 0.15 | m | Center-of-mass distance (L1 / 2) |
+| Link 2 COM Distance | l2 | 0.125 | m | Center-of-mass distance (L2 / 2) |
+| Link 1 Inertia | J1 | 0.001125 | kg*m^2 | Inertia about center of mass |
+| Link 2 Inertia | J2 | 0.000521 | kg*m^2 | Inertia about center of mass |
+| Gravity | g | 9.81 | m/s^2 | Acceleration due to gravity |
+| Cart Friction | b | 0.50 | N*s/m | Viscous damping on guide rail |
+| Joint 1 Damping | d1 | 0.005 | N*m*s/rad | Viscous rotational friction at Joint 1 |
+| Joint 2 Damping | d2 | 0.003 | N*m*s/rad | Viscous rotational friction at Joint 2 |
+| Actuator Peak Force | u_max | 60.0 | N | Linear servo peak actuator force |
+| Controller Frequency | f_isr | 1000 | Hz | Real-time Timer ISR execution rate |
+
 
 ---
 
