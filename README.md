@@ -180,16 +180,24 @@ python simulation/sympy_derivation.py
 python simulation/lqr_design.py
 ```
 
-### Step 3: Run Nonlinear Simulation & Visualizer
+### Step 3: Autonomous 3D Simulation & Self-Learning System
 ```bash
-# Execute numerical RK4 integration of the nonlinear system:
-python simulation/nonlinear_sim.py
+# 1. Launch interactive 3D simulation with autonomous self-righting:
+# Starts from ANY arbitrary angle (random, hanging down, or horizontal) and physically balances:
+python simulation/run_mujoco_lqr.py --init random
 
-# Plot 4-channel time response and print performance summary:
+# Specific initial state flags:
+python simulation/run_mujoco_lqr.py --init hanging      # Both poles hanging straight down (180 deg)
+python simulation/run_mujoco_lqr.py --init horizontal   # Both poles horizontal (90 deg)
+python simulation/run_mujoco_lqr.py --init upright      # Perturbed near upright
+python simulation/run_mujoco_lqr.py --impulse           # Injects periodic disturbance pulses
+
+# 2. Run High-Speed Headless Auto-Tuner & Evolutionary Optimizer:
+# Automatically learns optimal momentum pumping and LQR weights across all angles, saving to learned_params.json:
+python simulation/train_auto_tuning.py
+
+# 3. Plot 4-channel offline RK4 time response:
 python simulation/visualize.py
-
-# Launch interactive 3D physics simulation in MuJoCo:
-python -m mujoco.viewer --mjcf=simulation/model.xml
 ```
 
 ### Step 4: Run Automated Unit Tests
