@@ -1,0 +1,64 @@
+name: DIP Control CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  python-tests:
+    name: Dynamics & Control LQR Unit Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Lint and Syntax Check
+        run: |
+          python -m compileall simulation/ firmware/ tests/
+
+      - name: Execute LQR Stability and Controllability Unit Tests
+        run: |
+          pytest tests/ -v --durations=10
+
+      - name: Run Nonlinear ODE Simulation Sanity Check
+        run: |
+          python simulation/nonlinear_sim.py
+
+  firmware-build:
+    name: Embedded C Firmware Build Verification
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install GCC and Build Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc
+
+      - name: Compile Embedded C Firmware (Host Emulation Target)
+        run: |
+          mkdir -p firmware/build
+          gcc -Wall -Wextra -Werror -O2 -I firmware/include firmware/src/*.c -lm -o firmware/build/dip_firmware_sim
+
+      - name: Execute Firmware Sanity Loop
+        run: |
+          ./firmware/build/dip_firmware_sim

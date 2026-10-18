@@ -1,0 +1,63 @@
+<mujoco model="double_inverted_pendulum">
+  <compiler angle="radian" coordinate="local"/>
+  
+  <default>
+    <joint damping="0.005" armature="0.001"/>
+    <geom contype="1" conaffinity="1" friction="0.8 0.1 0.1"/>
+  </default>
+  
+  <visual>
+    <headlight ambient="0.4 0.4 0.4" diffuse="0.8 0.8 0.8" specular="0.1 0.1 0.1"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+  </visual>
+  
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="512"/>
+    <texture name="grid" type="2d" builtin="checker" rgb1="0.1 0.2 0.3" rgb2="0.2 0.3 0.4" width="512" height="512"/>
+    <material name="grid_mat" texture="grid" texrepeat="5 5" reflectance="0.2"/>
+    <material name="cart_mat" rgba="0.2 0.4 0.8 1"/>
+    <material name="pole1_mat" rgba="0.9 0.2 0.2 1"/>
+    <material name="pole2_mat" rgba="0.1 0.8 0.3 1"/>
+    <material name="rail_mat" rgba="0.5 0.5 0.5 1"/>
+    <material name="joint_mat" rgba="0.1 0.1 0.1 1"/>
+  </asset>
+  
+  <worldbody>
+    <light directional="true" pos="0 0 3" dir="0 0 -1"/>
+    <geom name="floor" type="plane" size="5 5 0.1" material="grid_mat"/>
+    <geom name="rail" type="capsule" fromto="-1.5 0 0.5 1.5 0 0.5" size="0.015" material="rail_mat"/>
+    
+    <!-- Cart -->
+    <body name="cart" pos="0 0 0.5">
+      <joint name="slider" type="slide" axis="1 0 0" limited="true" range="-1.2 1.2" damping="0.5"/>
+      <geom name="cart_geom" type="box" size="0.15 0.08 0.05" material="cart_mat" mass="1.2"/>
+      
+      <!-- Pendulum 1 -->
+      <body name="pole1" pos="0 0 0.05">
+        <joint name="hinge1" type="hinge" axis="0 1 0" damping="0.005" limited="false"/>
+        <geom name="joint1_geom" type="sphere" size="0.02" material="joint_mat" mass="0.01"/>
+        <geom name="pole1_geom" type="capsule" fromto="0 0 0 0 0 0.30" size="0.012" material="pole1_mat" mass="0.15"/>
+        
+        <!-- Pendulum 2 -->
+        <body name="pole2" pos="0 0 0.30">
+          <joint name="hinge2" type="hinge" axis="0 1 0" damping="0.003" limited="false"/>
+          <geom name="joint2_geom" type="sphere" size="0.018" material="joint_mat" mass="0.01"/>
+          <geom name="pole2_geom" type="capsule" fromto="0 0 0 0 0 0.25" size="0.010" material="pole2_mat" mass="0.10"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  
+  <actuator>
+    <motor name="cart_motor" joint="slider" gear="1" ctrllimited="true" ctrlrange="-25.0 25.0"/>
+  </actuator>
+  
+  <sensor>
+    <jointpos name="cart_pos" joint="slider"/>
+    <jointvel name="cart_vel" joint="slider"/>
+    <jointpos name="pole1_pos" joint="hinge1"/>
+    <jointvel name="pole1_vel" joint="hinge1"/>
+    <jointpos name="pole2_pos" joint="hinge2"/>
+    <jointvel name="pole2_vel" joint="hinge2"/>
+  </sensor>
+</mujoco>
