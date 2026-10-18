@@ -73,4 +73,8 @@ simulation/output/
 *.mp4
 *.gif
 *.csv
+*.TXT
+*.mjb
+mjmodel.xml
+screenshot*.png
 !simulation/model.xml
