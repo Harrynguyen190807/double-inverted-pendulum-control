@@ -37,12 +37,13 @@ extern "C" {
 /* LQR OPTIMAL GAIN VECTOR: u = - (Kx*x + Kx_dot*x_dot + ... )               */
 /* State Vector z = [x, x_dot, th1, th1_dot, th2, th2_dot]^T                 */
 /* ========================================================================== */
-#define LQR_K_X                      (-31.622777f)
-#define LQR_K_X_DOT                  (-37.842105f)
-#define LQR_K_TH1                    (178.532014f)
-#define LQR_K_TH1_DOT                (28.125412f)
-#define LQR_K_TH2                    (-245.187652f)
-#define LQR_K_TH2_DOT                (-31.421890f)
+#define LQR_K_X                      (400.000000f)
+#define LQR_K_X_DOT                  (397.857298f)
+#define LQR_K_TH1                    (1819.630163f)
+#define LQR_K_TH1_DOT                (-179.157067f)
+#define LQR_K_TH2                    (-3720.664533f)
+#define LQR_K_TH2_DOT                (-341.436391f)
+
 
 /* ========================================================================== */
 /* ACTUATOR & MOTOR DRIVER LIMITS                                             */

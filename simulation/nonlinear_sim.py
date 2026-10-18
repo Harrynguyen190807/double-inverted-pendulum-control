@@ -27,7 +27,8 @@ PARAMS = {
 
 # Pre-computed optimal LQR gains for default system: u = - K * z
 # State z = [x, dx, th1, dth1, th2, dth2]
-DEFAULT_K = [-31.622777, -37.842105, 178.532014, 28.125412, -245.187652, -31.421890]
+DEFAULT_K = [400.0, 397.857298, 1819.630163, -179.157067, -3720.664533, -341.436391]
+
 
 
 def solve_3x3_linear_system(A, b):
