@@ -1,49 +1,49 @@
 ---
 name: dip-physics-simulation
 description: >-
-  Mô phỏng Động lực học Phi tuyến & Trực quan hóa 3D cho Con lắc ngược đôi (DIP).
-  Chạy giải ODE phi tuyến với bão hòa lực (Saturation Clamp) và nhiễu xung kích (Impulse Disturbance),
-  xuất file cấu hình vật lý MuJoCo MJCF (model.xml) và vẽ đồ thị đáp ứng thời gian (visualize.py).
+  Nonlinear ODE Physics Simulation & 3D Visualization for the Double Inverted Pendulum (DIP).
+  Integrates full nonlinear equations with force saturation clamping and impulse disturbances,
+  provides MuJoCo MJCF 3D physics definition (model.xml), and plots response trajectories (visualize.py).
 ---
 
 # Skill: `dip-physics-simulation`
 
-## Tổng quan
-Skill này phụ trách việc kiểm chứng động học và thuật toán điều khiển trong môi trường mô phỏng số phi tuyến thực tế và mô phỏng vật lý 3D chuẩn công nghiệp (MuJoCo).
+## Overview
+This skill executes high-fidelity numerical simulation and physics-based validation for the Double Inverted Pendulum on a Cart (DIP), benchmarking controller robustness before hardware deployment.
 
-## Khi nào sử dụng
-- Khi cần kiểm tra khả năng ổn định vòng kín của bộ điều khiển LQR với phương trình vi phân phi tuyến đầy đủ (Nonlinear ODE), không chỉ là mô hình tuyến tính xấp xỉ.
-- Khi cần đánh giá sức bền của hệ thống dưới tác động của bão hòa lực chấp hành (Actuator Force Saturation Clamp, ví dụ $\pm 25\text{ N}$) và tải dòng tối đa của động cơ.
-- Khi kiểm thử tính bền vững (Robustness) trước nhiễu xung kích bên ngoài (Impulse Disturbance, ví dụ một cú đẩy $15\text{ N}$ trong $50\text{ ms}$).
-- Khi chạy mô phỏng vật lý 3D tương tác với MuJoCo thông qua file `simulation/model.xml`.
-- Khi cần xuất đồ thị đáp ứng quá độ thời gian của các trạng thái $(x, \theta_1, \theta_2, u)$ hoặc animation.
+## When to Use
+- When validating LQR closed-loop stability against the full nonlinear differential equations of motion rather than the linearized model.
+- When evaluating actuator force saturation limits (e.g. $\pm 25\text{ N}$) and testing for integrator windup or pole tip-over.
+- When performing robustness testing against external impulse disturbances (e.g. an abrupt $15\text{ N}$ lateral push lasting $50\text{ ms}$).
+- When running 3D interactive physics simulation using MuJoCo via `simulation/model.xml`.
+- When generating 4-channel response plots ($x, \theta_1, \theta_2, u$) or performance summary metrics.
 
-## Các lệnh & Công cụ thực thi
+## Commands & Workflows
 
-### 1. Chạy mô phỏng số phi tuyến RK4 / Solve IVP
+### 1. Run Nonlinear RK4 Integration
 ```bash
 python simulation/nonlinear_sim.py
 ```
-- Tích phân phương trình chuyển động phi tuyến thực nghiệm với bước tích phân $\Delta t = 1\text{ ms}$.
-- Tích hợp bộ điều khiển LQR và bộ giới hạn lực bão hòa.
-- Áp đặt nhiễu xung kích tại $t = 1.5\text{ s}$.
-- Xuất file kết quả quỹ đạo: `simulation/output_trajectory.csv`.
+- Performs Runge-Kutta 4th-order numerical integration with a step size of $\Delta t = 1.0\text{ ms}$.
+- Applies LQR state feedback with force saturation limits.
+- Injects external disturbance force at $t = 1.5\text{ s}$.
+- Exports trajectory data to `simulation/output_trajectory.csv`.
 
-### 2. Trực quan hóa Đồ thị & Đánh giá Chỉ số Hiệu năng
+### 2. Plot Response Trajectories & Performance Metrics
 ```bash
 python simulation/visualize.py
 ```
-- Đọc file `simulation/output_trajectory.csv` và tính toán các chỉ số kỹ thuật:
-  - Độ lệch vị trí cực đại của xe trượt ($x_{\max}$).
-  - Độ lệch góc cực đại của thanh lắc 1 và 2 ($\theta_{1,\max}, \theta_{2,\max}$).
-  - Lực chấp hành cực đại ($u_{\max}$) và thời gian quá độ xác lập ($t_s$).
-- Vẽ và lưu đồ thị chất lượng cao 4 kênh ra file `simulation/dip_response.png`.
+- Reads `simulation/output_trajectory.csv` and outputs engineering KPIs:
+  - Peak cart excursion ($x_{\max}$)
+  - Maximum link deflection angles ($\theta_{1,\max}, \theta_{2,\max}$)
+  - Maximum control effort ($u_{\max}$) and settling time ($t_s$)
+- Generates high-resolution 4-channel response figure saved to `simulation/dip_response.png`.
 
-### 3. Mô phỏng 3D tương tác với MuJoCo
+### 3. Launch Interactive 3D MuJoCo Simulation
 ```bash
 python -m mujoco.viewer --mjcf=simulation/model.xml
 ```
-- Khởi chạy cửa sổ tương tác 3D MuJoCo với mô hình vật lý chính xác:
-  - Ray trượt dẫn hướng (slider joint) giới hạn hành trình $[-1.2\text{ m}, +1.2\text{ m}]$.
-  - Khớp bản lề 1 & 2 với ma sát nhớt và ma sát khô thực.
-  - Cảm biến góc, vận tốc góc, vị trí xe và động cơ truyền động tuyến tính.
+- Renders an interactive 3D environment including:
+  - Slider joint rail with physical limits $[-1.2\text{ m}, +1.2\text{ m}]$.
+  - Low-friction revolute joints with viscous damping.
+  - Linear cart actuator with torque/force saturation constraints.

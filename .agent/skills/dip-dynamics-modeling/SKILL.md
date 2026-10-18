@@ -1,46 +1,47 @@
 ---
 name: dip-dynamics-modeling
 description: >-
-  Mô hình hóa Động lực học & Tính toán LQR cho hệ Con lắc ngược đôi trên xe trượt (DIP).
-  Sử dụng SymPy suy dẫn phương trình Euler-Lagrange, tuyến tính hóa quanh điểm thẳng đứng,
-  kiểm tra tính điều khiển được (Controllability Rank), giải Riccati (Bryson's Rule) và xuất ma trận K.
+  Dynamics Modeling & LQR Synthesis for the Double Inverted Pendulum on a Cart (DIP).
+  Derives symbolic Euler-Lagrange equations via SymPy, linearizes around upright equilibrium,
+  verifies controllability matrix rank, solves continuous ARE (Bryson's Rule), and exports gain matrix K.
 ---
 
 # Skill: `dip-dynamics-modeling`
 
-## Tổng quan
-Skill này chịu trách nhiệm tự động hóa toàn bộ chu trình thiết lập mô hình toán học và tổng hợp bộ điều khiển tối ưu LQR cho hệ Double Inverted Pendulum on a Cart (DIP).
+## Overview
+This skill automates the complete mathematical modeling and optimal controller synthesis pipeline for the Double Inverted Pendulum on a Cart (DIP) system.
 
-## Khi nào sử dụng
-- Khi cần kiểm tra lại hoặc suy dẫn lại phương trình động lực học Euler-Lagrange phi tuyến bằng SymPy.
-- Khi người dùng thay đổi kích thước, khối lượng cơ khí ($M, m_1, m_2, L_1, L_2$) hoặc ma sát ($b, d_1, d_2$).
-- Khi cần tuyến tính hóa hệ quanh điểm cân bằng thẳng đứng và xuất ma trận trạng thái $A$ (6x6), $B$ (6x1).
-- Khi kiểm tra tính điều khiển được $\text{rank}(\mathcal{C}) == 6$ của hệ thống.
-- Khi tinh chỉnh trọng số Bryson $Q, R$ để tìm bộ độ lợi phản hồi trạng thái tối ưu $K = [k_x, k_{\dot{x}}, k_{\theta_1}, k_{\dot{\theta}_1}, k_{\theta_2}, k_{\dot{\theta}_2}]$.
-- Khi tự động sinh mã định nghĩa C-header (`dip_config.h`) để nạp trực tiếp vào firmware nhúng.
+## When to Use
+- When deriving or re-verifying nonlinear Euler-Lagrange equations of motion using SymPy.
+- When updating mechanical or physical parameters ($M, m_1, m_2, L_1, L_2$) or damping coefficients ($b, d_1, d_2$).
+- When linearizing the dynamics around the upright vertical equilibrium to extract state-space matrices $\mathbf{A} \in \mathbb{R}^{6 \times 6}$ and $\mathbf{B} \in \mathbb{R}^{6 \times 1}$.
+- When verifying the Kalman Controllability Matrix rank ($\text{rank}(\mathcal{C}) == 6$).
+- When tuning Bryson's rule weights $\mathbf{Q}, \mathbf{R}$ to synthesize the optimal state-feedback gain vector $\mathbf{K} = [k_x, k_{\dot{x}}, k_{\theta_1}, k_{\dot{\theta}_1}, k_{\theta_2}, k_{\dot{\theta}_2}]$.
+- When generating C header code snippets (`dip_config.h`) for embedded firmware.
 
-## Các lệnh & Công cụ thực thi
+## Commands & Workflows
 
-### 1. Chạy suy dẫn ký hiệu SymPy
+### 1. Symbolic Derivation via SymPy
 ```bash
 python simulation/sympy_derivation.py
 ```
-- Tự động thiết lập hàm Lagrange $\mathcal{L} = T - V$.
-- Đạo hàm Euler-Lagrange với lực suy rộng không bảo toàn $Q$.
-- Tính ma trận quán tính $\mathbf{M}(q)$, ma trận Coriolis $\mathbf{C}(q, \dot{q})$, vector trọng lực $\mathbf{G}(q)$.
-- Xuất ma trận tuyến tính $A$ và $B$ dưới dạng symbolic và numerical.
+- Formulates the Lagrangian $\mathcal{L} = T - V$.
+- Evaluates Euler-Lagrange equations with non-conservative generalized forces $\mathbf{Q}$.
+- Computes inertia matrix $\mathbf{M}(\mathbf{q})$, Coriolis matrix $\mathbf{C}(\mathbf{q}, \dot{\mathbf{q}})$, and gravity vector $\mathbf{G}(\mathbf{q})$.
+- Extracts symbolic and numerical linearized $\mathbf{A}$ and $\mathbf{B}$ matrices.
 
-### 2. Thiết kế & Tinh chỉnh bộ điều khiển LQR
+### 2. Numerical LQR Design & Bryson Tuning
 ```bash
 python simulation/lqr_design.py
 ```
-- Kiểm tra tính điều khiển được (Kalman Controllability Matrix Rank).
-- Thiết lập trọng số theo quy tắc Bryson:
+- Computes Kalman controllability matrix:
+  $$\mathcal{C} = [\mathbf{B}, \mathbf{A}\mathbf{B}, \mathbf{A}^2\mathbf{B}, \mathbf{A}^3\mathbf{B}, \mathbf{A}^4\mathbf{B}, \mathbf{A}^5\mathbf{B}]$$
+- Applies Bryson's rule:
   $$Q_{ii} = \frac{1}{(\Delta z_{i,\max})^2}, \quad R = \frac{1}{(u_{\max})^2}$$
-- Giải phương trình đại số Riccati liên tục (CARE):
+- Solves Continuous Algebraic Riccati Equation (CARE):
   $$\mathbf{A}^T \mathbf{P} + \mathbf{P}\mathbf{A} - \mathbf{P}\mathbf{B}\mathbf{R}^{-1}\mathbf{B}^T \mathbf{P} + \mathbf{Q} = 0$$
-- Xuất ma trận độ lợi $K = \mathbf{R}^{-1}\mathbf{B}^T \mathbf{P}$ và các cực vòng kín $\lambda(\mathbf{A} - \mathbf{B}\mathbf{K})$.
-- Xuất đoạn mã C header snippet tương thích với `firmware/include/dip_config.h`.
+- Computes closed-loop poles $\lambda(\mathbf{A} - \mathbf{B}\mathbf{K})$ and confirms asymptotic stability.
+- Exports C-compatible macro definitions for `firmware/include/dip_config.h`.
 
-## Tinh chỉnh Tham số Nhanh
-Để thay đổi thông số vật lý của hệ thống, chỉnh sửa trực tiếp hàm `get_default_parameters()` trong `simulation/sympy_derivation.py` hoặc class `DIPDynamics` trong `simulation/lqr_design.py`.
+## Parameter Adjustment
+To modify mechanical parameters, edit `get_default_parameters()` in `simulation/sympy_derivation.py` or the `DIPDynamics` class in `simulation/lqr_design.py`.
