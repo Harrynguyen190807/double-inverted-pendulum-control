@@ -116,12 +116,16 @@ def compute_lqr_gain(model, data, Q_diag, R_val=0.01):
     A_abs = T @ A_rel @ Tinv
     B_abs = T @ B_rel
 
-    Q = np.diag(Q_diag)
-    R = np.array([[R_val]])
+    Q = np.diag(np.maximum(Q_diag, 1e-4))
+    R = np.array([[max(float(R_val), 1e-5)]])
 
-    P = solve_continuous_are(A_abs, B_abs, Q, R)
-    K = np.linalg.inv(R) @ (B_abs.T @ P)
-    return K
+    try:
+        P = solve_continuous_are(A_abs, B_abs, Q, R)
+        K = np.linalg.inv(R) @ (B_abs.T @ P)
+        return K
+    except Exception as e:
+        print(f"[WARN] solve_continuous_are failed ({e}), using safe fallback gains.")
+        return np.array([[-25.0, -12.0, 350.0, 45.0, 400.0, 45.0]])
 
 
 class DIPLearner:
@@ -296,6 +300,9 @@ def evaluate_trial(model, data, K, swing_params, init_pos, duration=10.0):
     cumulative_streak_reward = 0.0
     total_drift_penalty = 0.0
     total_micro_osc_penalty = 0.0
+    total_lqr_penalty = 0.0
+    early_terminated = False
+    terminal_crash = False
 
     for step in range(total_steps):
         t = step * dt
@@ -317,10 +324,8 @@ def evaluate_trial(model, data, K, swing_params, init_pos, duration=10.0):
             current_streak += dt
             if current_streak > max_streak:
                 max_streak = current_streak
-            # Progressive streak reward: rewards holding unbroken continuous equilibrium
             cumulative_streak_reward += current_streak * dt
         else:
-            # Reset streak if balance breaks below perfect threshold
             current_streak = 0.0
 
         th1_deg = np.degrees(th1)
@@ -334,26 +339,25 @@ def evaluate_trial(model, data, K, swing_params, init_pos, duration=10.0):
         is_recovery = (max_th_abs > 0.08)
 
         if not is_recovery:
-            # Balance Mode: heavily penalize cart displacement from track center and micro-oscillations
             cart_drift = 0.5 * (x / 0.5)**2 + 0.1 * (dx / 0.5)**2
             if abs(x) > 1.4:
                 cart_drift += 5.0 * (abs(x) - 1.4)
             total_drift_penalty += cart_drift * dt
-
-            # Suppress micro-oscillations near vertical
             total_micro_osc_penalty += (dth1**2 + dth2**2) * dt
         else:
-            # Recovery Mode: IGNORE cart drift and micro-oscillation penalties
-            # Only penalize severe danger of rail collision (|x| > 2.0m)
             if abs(x) > 2.0:
                 total_drift_penalty += 10.0 * (abs(x) - 2.0) * dt
 
         # Early termination checks to maximize compute efficiency:
         # 1. Cart hits rail stop (|x| > 2.15m) -> physical crash, unrecoverable
         if abs(x) > 2.15:
+            early_terminated = True
+            terminal_crash = True
             break
         # 2. Post-catch fall: if already caught but subsequently lost balance and dropped past 45 deg
         if caught and mode == "SWING" and (abs(th1_deg) > 45.0 or abs(th2_deg) > 45.0):
+            early_terminated = True
+            terminal_crash = False
             break
 
         z = np.array([x, dx, th1, dth1, th2, dth2])
@@ -395,17 +399,39 @@ def evaluate_trial(model, data, K, swing_params, init_pos, duration=10.0):
                 
             u = np.clip(u_track + u_align, -u_max, u_max)
 
+        # Compute Step LQR Quadratic Cost:
+        # Penalty = 100 * th1^2 + 200 * th2^2 + 10 * x^2 + 1 * dx^2 + 0.1 * u^2
+        step_lqr_cost = (
+            100.0 * (th1 ** 2) +
+            200.0 * (th2 ** 2) +
+            10.0 * (x ** 2) +
+            1.0 * (dx ** 2) +
+            0.1 * (u ** 2)
+        )
+
+        # Severe penalty if cart is near rail border (|x| > 0.8 * x_limit = 1.76m)
+        if abs(x) > 1.76:
+            ov = abs(x) - 1.76
+            step_lqr_cost += 1000.0 * ov + 2500.0 * (ov ** 2)
+
+        total_lqr_penalty += step_lqr_cost * dt
+
         data.ctrl[0] = u
         mujoco.mj_step(model, data)
 
-    # Pad remaining steps if early terminated so mean_score correctly accounts for failure
+    # Pad remaining steps if early terminated so metrics correctly account for failure
     remaining_steps = total_steps - len(scores)
     if remaining_steps > 0:
         scores.extend([0.0] * remaining_steps)
+        # Heavy penalty for unsimulated steps due to truncation/failure
+        total_lqr_penalty += remaining_steps * 3000.0 * dt
+    if terminal_crash:
+        total_lqr_penalty += 5000.0  # Severe crash collision penalty
 
     mean_score = float(np.mean(scores))
     peak_score = float(np.max(scores)) if len(scores) > 0 else 0.0
     return {
+        "lqr_penalty": float(total_lqr_penalty),
         "mean_score": mean_score,
         "peak_score": peak_score,
         "time_at_100": time_at_100,

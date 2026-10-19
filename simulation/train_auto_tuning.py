@@ -1,26 +1,22 @@
 """
 Autonomous Optimization & Evolutionary Auto-Tuner for Double Inverted Pendulum (DIP)
-Lead Mechatronics & Embedded Control Engineer - Version 3.0
+Lead Mechatronics & Embedded Control Engineer - Version 3.1
 
-Architectural Enhancements:
-1. Strict Catch Hierarchy:
-   - +500.0 pts for every successfully caught scenario.
-   - Any individual with higher catches (e.g., 4/5 or 5/5) is mathematically guaranteed
-     to achieve a higher fitness than any 3/5 candidate.
-2. Gain Scheduling / Dual-Mode Controller:
-   - Evaluates two specialized LQR gain matrices:
-     * Recovery Mode (max(|th1|, |th2|) > 0.08 rad / ~4.58 deg): High pole gains, aggressive
-       control effort to whip the cart and pull the pendulum back; suppresses drift and micro-osc penalties.
-     * Balance Mode (max(|th1|, |th2|) <= 0.08 rad): Smooth gains, penalizes drift to pull cart
-       toward track center (x = 0), suppresses micro-oscillations, and maximizes continuous 100-pt hold.
-3. Curriculum Learning (Graduated Angle Progression):
-   - Stage 1 (Gen 1-30): Moderate tilt angles (3 deg to 8 deg) to perfect Balance Mode and centering.
-   - Stage 2 (Gen 31-60): Large tilt angles (6 deg to 20 deg) to perfect Recovery Mode.
-   - Stage 3 (Gen 61+): Full spectrum evaluation (upright, 20 deg, horizontal 90 deg, -120 deg, hanging 180 deg).
-4. Advanced Evolutionary Search:
-   - Eliminated 100%-failing Random Injection.
-   - Top-5 Elitism: Best 5 candidates preserved across generations.
-   - Differential Evolution (DE) + Directed Mutation centered on the all-time best-catch champion.
+Key Upgrades:
+1. Quadratic LQR Penalty (Strictly Negative Fitness):
+   - Penalty = sum( 100 * th1^2 + 200 * th2^2 + 10 * x^2 + 1 * dx^2 + 0.1 * u^2 )
+   - Severe boundary penalty added when cart approaches rail borders (|x| > 0.8 * x_limit = 1.76m).
+   - Fitness to maximize: Fitness = - Average Penalty.
+2. Random Restart / Island Model on Stagnation (> 50 Gens):
+   - Preserves best-ever elite individual.
+   - Regenerates 75% of population randomly across valid parameter space to escape deep local minima.
+   - Resets stagnation counter to allow fresh convergence.
+3. Hurwitz-Stable LQR Synthesis:
+   - Does NOT search raw 6D K matrix entries.
+   - Optimizes diagonal Q = diag(q_x, q_dx, q_th1, q_dth1, q_th2, q_dth2) > 0 and R > 0.
+   - Solves Continuous Algebraic Riccati Equation (scipy.linalg.solve_continuous_are)
+     to guarantee 100% closed-loop Hurwitz stability.
+4. Gain-Scheduled Dual-Mode (Balance & Recovery) + Curriculum Learning.
 """
 
 import os
@@ -39,7 +35,7 @@ from dip_learner import (
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Autonomous Evolutionary Auto-Tuner for Double Inverted Pendulum (v3.0)"
+        description="Autonomous Evolutionary Auto-Tuner for Double Inverted Pendulum (v3.1)"
     )
     parser.add_argument(
         "--generations", "--gens",
@@ -134,7 +130,7 @@ PARAM_SCHEMA = [
     ("swingup", "catch_dth_max", (2.2, 4.5),     0.12),
     ("swingup", "catch_u_max",   (40.0, 58.0),   1.2),
 
-    # Balance Mode LQR parameters (7) - Focused on centering, jitter damping, smoothness
+    # Balance Mode LQR parameters (7) - Q diagonal + R
     ("lqr_balance", "q_x",       (50.0, 150.0),  4.0),
     ("lqr_balance", "q_dx",      (6.0, 25.0),    0.8),
     ("lqr_balance", "q_th1",     (600.0, 1400.0), 30.0),
@@ -143,7 +139,7 @@ PARAM_SCHEMA = [
     ("lqr_balance", "q_dth2",    (25.0, 60.0),   2.0),
     ("lqr_balance", "r_u",       (0.008, 0.03),  0.001),
 
-    # Recovery Mode LQR parameters (7) - Focused on aggressive pole catch, low control penalty
+    # Recovery Mode LQR parameters (7) - Q diagonal + R
     ("lqr_recovery", "q_x",      (5.0, 30.0),    2.0),
     ("lqr_recovery", "q_dx",     (1.0, 8.0),     0.4),
     ("lqr_recovery", "q_th1",    (1500.0, 3500.0), 50.0),
@@ -172,6 +168,14 @@ def vector_to_params(vec, template_params):
     return ind
 
 
+def sample_random_individual(template_params):
+    """Generates an exploratory individual uniformly sampled from search space bounds."""
+    ind = copy.deepcopy(template_params)
+    for section, key, (low, high), sigma in PARAM_SCHEMA:
+        ind[section][key] = float(np.random.uniform(low, high))
+    return ind
+
+
 # Worker global caches for ProcessPoolExecutor
 _worker_model = None
 _worker_data = None
@@ -186,18 +190,18 @@ def _worker_init(xml_path):
 
 def evaluate_candidate(candidate_params, model, data, scenarios, duration=20.0):
     """
-    Evaluates a candidate across the specified scenarios using the Dual-Mode Controller.
-    Computes fitness with strict catch hierarchy (+500.0 / catch).
+    Evaluates a candidate across scenarios using Hurwitz-stable LQR synthesis.
+    Computes LQR Quadratic Penalty:
+      Penalty = sum( 100*th1^2 + 200*th2^2 + 10*x^2 + 1*dx^2 + 0.1*u^2 ) + rail_border_penalties.
+    Fitness = - Average Penalty (maximizing Fitness directly minimizes Penalty).
     """
+    total_penalty = 0.0
     total_mean = 0.0
     total_peak = 0.0
     total_max_streak = 0.0
-    total_streak_reward = 0.0
-    total_drift = 0.0
-    total_micro_osc = 0.0
     catches = 0
 
-    # 1. Synthesize Balance Mode LQR Gain
+    # 1. Synthesize Hurwitz-Stable Balance LQR Gain via solve_continuous_are
     bal_cfg = candidate_params["lqr_balance"]
     q_bal = [
         bal_cfg["q_x"], bal_cfg["q_dx"],
@@ -206,7 +210,7 @@ def evaluate_candidate(candidate_params, model, data, scenarios, duration=20.0):
     ]
     k_bal = compute_lqr_gain(model, data, q_bal, bal_cfg.get("r_u", 0.015))
 
-    # 2. Synthesize Recovery Mode LQR Gain
+    # 2. Synthesize Hurwitz-Stable Recovery LQR Gain via solve_continuous_are
     rec_cfg = candidate_params["lqr_recovery"]
     q_rec = [
         rec_cfg["q_x"], rec_cfg["q_dx"],
@@ -220,45 +224,30 @@ def evaluate_candidate(candidate_params, model, data, scenarios, duration=20.0):
 
     for name, init_pos in scenarios:
         res = evaluate_trial(model, data, K_dual, sw_cfg, init_pos, duration=duration)
+        total_penalty += res["lqr_penalty"]
         total_mean += res["mean_score"]
         total_peak += res["peak_score"]
         total_max_streak += res["max_streak"]
-        total_streak_reward += res["streak_reward"]
-        total_drift += res["drift_penalty"]
-        total_micro_osc += res["micro_osc_penalty"]
         if res["caught"]:
             catches += 1
 
     n = len(scenarios)
+    avg_penalty = total_penalty / n
     avg_mean = total_mean / n
     avg_peak = total_peak / n
     avg_streak = total_max_streak / n
-    avg_streak_reward = total_streak_reward / n
-    avg_drift = total_drift / n
-    avg_micro_osc = total_micro_osc / n
 
-    # STRICT CATCH HIERARCHY FITNESS SYNTHESIS:
-    # +500.0 pts for each caught scenario ensures an individual catching 4/5 or 5/5
-    # will strictly beat any individual catching only 3/5.
-    fitness = (
-        500.0 * catches +
-        1.0 * avg_mean +
-        0.3 * avg_peak +
-        15.0 * avg_streak +
-        2.0 * avg_streak_reward -
-        1.0 * avg_drift -
-        0.4 * avg_micro_osc
-    )
+    # Fitness to maximize: negative of the average LQR quadratic penalty
+    fitness = - float(avg_penalty)
 
     metrics = {
         "fitness": fitness,
+        "avg_penalty": avg_penalty,
         "avg_mean": avg_mean,
         "avg_peak": avg_peak,
         "avg_streak": avg_streak,
         "catches": catches,
-        "total_scenarios": n,
-        "avg_drift": avg_drift,
-        "avg_micro_osc": avg_micro_osc
+        "total_scenarios": n
     }
     return fitness, metrics
 
@@ -277,17 +266,17 @@ def main():
         np.random.seed(args.seed)
 
     print("=" * 85)
-    print("   DOUBLE INVERTED PENDULUM (DIP) - DUAL-MODE CURRICULUM AUTO-TUNER v3.0   ")
+    print("   DOUBLE INVERTED PENDULUM (DIP) - QUADRATIC LQR AUTO-TUNER v3.1   ")
     print("=" * 85)
     print(f"Configurations:")
     print(f" - Generations:            {args.generations}")
     print(f" - Population Size:         {args.pop_size} individuals / gen")
     print(f" - Episode Duration:        {args.max_hold_target:.1f} s / trial")
     print(f" - Parallel CPU Workers:    {args.workers} workers")
-    print(f" - Catch Hierarchy:         +500.0 pts / catch (Strict Priority)")
-    print(f" - Dual-Mode Controller:    Recovery Mode (th > 0.08 rad) + Balance Mode (th <= 0.08 rad)")
-    print(f" - Curriculum Stages:       Stage 1 (1-30) -> Stage 2 (31-60) -> Stage 3 (61+)")
-    print(f" - Search Mechanism:        Top-5 Elitism + Differential Evolution + Best-Catch Attraction\n")
+    print(f" - Objective Function:      LQR Quadratic Penalty: sum(100*th1^2 + 200*th2^2 + 10*x^2 + dx^2 + 0.1*u^2)")
+    print(f" - Rail Boundary Guard:     Heavy Penalty when |x| > 0.8 * x_limit (1.76m)")
+    print(f" - Hurwitz Stability:       100% Guaranteed via Q-diag/R Riccati ARE (scipy.linalg.solve_continuous_are)")
+    print(f" - Stagnation Recovery:     Random Restart / Island Reset when Stagnant > 50 gens (75% Regenerated)\n")
 
     if not os.path.exists(MODEL_XML):
         print(f"[ERROR] model.xml not found at {MODEL_XML}")
@@ -305,13 +294,11 @@ def main():
 
     print("[1/3] Evaluating current baseline parameters on initial stage...")
     base_fit, base_metrics = evaluate_candidate(best_params, model, data, active_scenarios, duration=args.max_hold_target)
-    print(f"      Baseline Fitness:     {base_fit:6.1f}")
+    print(f"      Baseline Penalty:     {base_metrics['avg_penalty']:7.1f} (Fitness: {base_fit:7.1f})")
     print(f"      Mean Score:           {base_metrics['avg_mean']:5.1f} / 100")
     print(f"      Peak Score:           {base_metrics['avg_peak']:5.1f} / 100")
     print(f"      Max Hold Streak:      {base_metrics['avg_streak']:5.2f} s")
-    print(f"      Apex Catches:         {base_metrics['catches']} / {base_metrics['total_scenarios']}")
-    print(f"      Cart Drift Penalty:   {base_metrics['avg_drift']:5.2f}")
-    print(f"      Micro-Osc Penalty:    {base_metrics['avg_micro_osc']:5.2f}\n")
+    print(f"      Apex Catches:         {base_metrics['catches']} / {base_metrics['total_scenarios']}\n")
 
     best_fitness = base_fit
     best_metrics_recorded = base_metrics
@@ -340,63 +327,89 @@ def main():
                 print("\n" + "=" * 85)
                 print(f"  >>> CURRICULUM UPGRADE (Gen {gen:03d}): Entering {stage_name} <<<")
                 print("=" * 85)
-                # Re-evaluate best on new curriculum scenarios to establish valid baseline
                 base_fit, base_metrics = evaluate_candidate(best_params, model, data, active_scenarios, duration=args.max_hold_target)
                 best_fitness = base_fit
                 best_metrics_recorded = base_metrics
                 stagnation_counter = 0
                 prev_stage = current_stage
 
-            # Adaptive search parameters
-            if stagnation_counter >= 5:
-                mut_scale = 1.8
-                stag_status = f"STAGNANT ({stagnation_counter} gens): Directed DE Mutation Active"
-            else:
+            # =========================================================
+            # STAGNATION & RANDOM RESTART / ISLAND MODEL (> 50 GENS)
+            # =========================================================
+            if stagnation_counter >= 50:
+                print("\n" + "=" * 85)
+                print(f"  [>>> RANDOM RESTART / ISLAND RESET (Gen {gen:03d}) <<<] Stagnant for {stagnation_counter} gens!")
+                print("  --> Preserving best elite individual and randomly regenerating 75% of population to escape local minimum!")
+                print("=" * 85 + "\n")
+
+                population = [copy.deepcopy(best_params)]
+                num_random = int(round(0.75 * args.pop_size))
+                for _ in range(num_random):
+                    population.append(sample_random_individual(best_params))
+
+                needed = args.pop_size - len(population)
+                for _ in range(needed):
+                    child_vec = params_to_vector(best_params) + np.random.normal(0.0, SIGMA_VECTOR * 2.5)
+                    population.append(vector_to_params(child_vec, best_params))
+
+                stagnation_counter = 0
                 mut_scale = 1.0
-                stag_status = f"Exploiting (Stag: {stagnation_counter}/5)"
-
-            # =========================================================
-            # POPULATION GENERATION: ELITISM + DE + DIRECTED MUTATION
-            # =========================================================
-            population = []
-
-            # 1. Elitism: Preserve up to Top 5 unique elite candidates
-            for elite in elite_pool[:min(5, len(elite_pool))]:
-                population.append(copy.deepcopy(elite))
-
-            # Fill remainder of population using advanced operators
-            vec_best_catch = params_to_vector(best_catch_ind)
-            needed = args.pop_size - len(population)
-
-            for i in range(needed):
-                # Select a parent from elite pool (weighted towards rank 0)
-                parent_idx = np.random.choice(len(elite_pool), p=np.exp(-0.7 * np.arange(len(elite_pool))) / np.sum(np.exp(-0.7 * np.arange(len(elite_pool)))))
-                parent_vec = params_to_vector(elite_pool[parent_idx])
-
-                op_choice = np.random.random()
-
-                if op_choice < 0.50:
-                    # Operator A: Directed Mutation toward Best-Catch Champion
-                    alpha = np.random.uniform(0.15, 0.45)
-                    noise = np.random.normal(0.0, SIGMA_VECTOR * mut_scale)
-                    child_vec = parent_vec + alpha * (vec_best_catch - parent_vec) + noise
-
-                elif op_choice < 0.85 and len(elite_pool) >= 2:
-                    # Operator B: Differential Evolution (DE/best/1 or DE/rand/1)
-                    idx1, idx2 = np.random.choice(len(elite_pool), size=2, replace=(len(elite_pool) < 2))
-                    v1 = params_to_vector(elite_pool[idx1])
-                    v2 = params_to_vector(elite_pool[idx2])
-                    diff = v1 - v2
-                    F = np.random.uniform(0.5, 0.8)
-                    noise = np.random.normal(0.0, SIGMA_VECTOR * 0.4)
-                    child_vec = parent_vec + F * diff + noise
-
+                stag_status = "ISLAND RESTART: 75% Random Reset (Reset to 0)"
+            else:
+                # Progressive mutation scale
+                if stagnation_counter >= 25:
+                    mut_scale = 2.0
+                    stag_status = f"High Mutation ({stagnation_counter}/50, MutScale=2.0x)"
+                elif stagnation_counter >= 10:
+                    mut_scale = 1.4
+                    stag_status = f"Moderate Mutation ({stagnation_counter}/50, MutScale=1.4x)"
                 else:
-                    # Operator C: Local Gaussian Jitter around parent
-                    noise = np.random.normal(0.0, SIGMA_VECTOR * mut_scale)
-                    child_vec = parent_vec + noise
+                    mut_scale = 1.0
+                    stag_status = f"Fine Tuning ({stagnation_counter}/50)"
 
-                population.append(vector_to_params(child_vec, best_params))
+                # =========================================================
+                # POPULATION GENERATION: ELITISM + DE + DIRECTED MUTATION
+                # =========================================================
+                population = []
+
+                # Preserve up to Top 5 unique elite candidates
+                for elite in elite_pool[:min(5, len(elite_pool))]:
+                    population.append(copy.deepcopy(elite))
+
+                vec_best_catch = params_to_vector(best_catch_ind)
+                needed = args.pop_size - len(population)
+
+                for i in range(needed):
+                    parent_idx = np.random.choice(
+                        len(elite_pool),
+                        p=np.exp(-0.7 * np.arange(len(elite_pool))) / np.sum(np.exp(-0.7 * np.arange(len(elite_pool))))
+                    )
+                    parent_vec = params_to_vector(elite_pool[parent_idx])
+
+                    op_choice = np.random.random()
+
+                    if op_choice < 0.50:
+                        # Directed Mutation towards Best-Catch Champion
+                        alpha = np.random.uniform(0.15, 0.45)
+                        noise = np.random.normal(0.0, SIGMA_VECTOR * mut_scale)
+                        child_vec = parent_vec + alpha * (vec_best_catch - parent_vec) + noise
+
+                    elif op_choice < 0.85 and len(elite_pool) >= 2:
+                        # Differential Evolution (DE)
+                        idx1, idx2 = np.random.choice(len(elite_pool), size=2, replace=(len(elite_pool) < 2))
+                        v1 = params_to_vector(elite_pool[idx1])
+                        v2 = params_to_vector(elite_pool[idx2])
+                        diff = v1 - v2
+                        F = np.random.uniform(0.5, 0.8)
+                        noise = np.random.normal(0.0, SIGMA_VECTOR * 0.4)
+                        child_vec = parent_vec + F * diff + noise
+
+                    else:
+                        # Local Gaussian Jitter
+                        noise = np.random.normal(0.0, SIGMA_VECTOR * mut_scale)
+                        child_vec = parent_vec + noise
+
+                    population.append(vector_to_params(child_vec, best_params))
 
             # =========================================================
             # PARALLEL EVALUATION ACROSS WORKERS
@@ -411,7 +424,6 @@ def main():
             # Update Elite Pool (Top 5 unique individuals)
             elite_pool = [c[2] for c in candidates[:5]]
 
-            # Track all-time highest catches champion
             if top_met["catches"] > best_catch_count:
                 best_catch_count = top_met["catches"]
                 best_catch_ind = copy.deepcopy(top_cand)
@@ -424,20 +436,13 @@ def main():
 
             if top_fit > best_fitness:
                 is_new_best = True
-                save_reason = f"+{top_fit - best_fitness:4.1f} Fit"
-            elif top_met["catches"] > best_metrics_recorded.get("catches", 0):
-                is_new_best = True
-                save_reason = f"RECORD CATCHES ({top_met['catches']}/{top_met['total_scenarios']})"
-            elif (top_met["catches"] == best_metrics_recorded.get("catches", 0) and
-                  top_met["avg_mean"] > best_metrics_recorded.get("avg_mean", 0.0) + 1.0 and
-                  top_fit >= best_fitness * 0.98):
-                is_new_best = True
-                save_reason = f"RECORD MEAN ({top_met['avg_mean']:5.1f} vs {best_metrics_recorded['avg_mean']:5.1f})"
+                pen_reduction = best_metrics_recorded["avg_penalty"] - top_met["avg_penalty"]
+                save_reason = f"-{pen_reduction:5.1f} Penalty"
 
             gen_elapsed = time.time() - gen_start_time
 
             if is_new_best:
-                best_fitness = max(best_fitness, top_fit)
+                best_fitness = top_fit
                 best_params = top_cand
                 best_metrics_recorded = top_met
                 stagnation_counter = 0
@@ -449,7 +454,7 @@ def main():
                 best_params["episodes_trained"] = best_params.get("episodes_trained", 0) + args.pop_size
                 learner.save(best_params)
 
-                print(f"  [Gen {gen:03d}/{args.generations:03d}] [+] NEW BEST ({save_reason}) | Fit: {top_fit:6.1f} | "
+                print(f"  [Gen {gen:03d}/{args.generations:03d}] [+] NEW BEST (Pen: {top_met['avg_penalty']:6.1f}, {save_reason}) | "
                       f"Mean: {top_met['avg_mean']:5.1f}/100 | Peak: {top_met['avg_peak']:5.1f} | "
                       f"Streak: {top_met['avg_streak']:4.2f}s | Catches: {top_met['catches']}/{top_met['total_scenarios']} | "
                       f"Time: {gen_elapsed:4.1f}s | SAVED!")
@@ -457,15 +462,15 @@ def main():
                 stagnation_counter += 1
                 best_params["episodes_trained"] = best_params.get("episodes_trained", 0) + args.pop_size
 
-                # Periodic progress log
-                if gen % 2 == 0 or stagnation_counter == 5:
-                    print(f"  [Gen {gen:03d}/{args.generations:03d}] BestFit: {best_fitness:6.1f} | TopGenMean: {top_met['avg_mean']:5.1f}/100 | "
-                          f"TopStreak: {top_met['avg_streak']:4.2f}s | Catches: {top_met['catches']}/{top_met['total_scenarios']} | "
+                if gen % 2 == 0 or stagnation_counter >= 50 or "ISLAND" in stag_status:
+                    print(f"  [Gen {gen:03d}/{args.generations:03d}] BestPen: {best_metrics_recorded['avg_penalty']:6.1f} | "
+                          f"TopPen: {top_met['avg_penalty']:6.1f} | Mean: {top_met['avg_mean']:5.1f}/100 | "
+                          f"Streak: {top_met['avg_streak']:4.2f}s | Catches: {top_met['catches']}/{top_met['total_scenarios']} | "
                           f"Time: {gen_elapsed:4.1f}s | {stag_status}")
 
     print("\n" + "=" * 85)
     print("[3/3] Evolutionary Optimization Complete!")
-    print(f"      Final Best Fitness:         {best_fitness:6.1f}")
+    print(f"      Final Best Penalty:         {best_metrics_recorded['avg_penalty']:6.1f} (Fitness: {best_fitness:6.1f})")
     print(f"      Final Best Mean Score:      {best_metrics_recorded['avg_mean']:5.1f} / 100")
     print(f"      Final Best Peak Score:      {best_metrics_recorded['avg_peak']:5.1f} / 100")
     print(f"      Final Max Hold Streak:      {best_metrics_recorded['avg_streak']:5.2f} s")
