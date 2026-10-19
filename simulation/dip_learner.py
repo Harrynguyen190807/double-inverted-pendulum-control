@@ -18,6 +18,7 @@ Key Capabilities:
 import os
 import json
 import time
+import copy
 import numpy as np
 import mujoco
 from scipy.linalg import solve_continuous_are
@@ -127,7 +128,7 @@ class DIPLearner:
     """Manages parameter learning, adaptation, and JSON storage."""
     
     DEFAULT_PARAMS = {
-        "version": "2.1",
+        "version": "3.0",
         "best_mean_score": 0.0,
         "peak_score": 0.0,
         "episodes_trained": 0,
@@ -145,14 +146,23 @@ class DIPLearner:
             "catch_dth_max": 3.8,     # Catch angular velocity limit (rad/s)
             "catch_u_max": 55.0       # Max un-saturated LQR force threshold (N)
         },
-        "lqr": {
-            "q_x": 70.0,
-            "q_dx": 10.0,
+        "lqr_balance": {              # Fine balance mode (max(|th1|, |th2|) <= 0.08 rad)
+            "q_x": 85.0,
+            "q_dx": 12.0,
             "q_th1": 850.0,
             "q_dth1": 38.0,
             "q_th2": 850.0,
             "q_dth2": 38.0,
-            "r_u": 0.01
+            "r_u": 0.015
+        },
+        "lqr_recovery": {             # Aggressive recovery mode (max(|th1|, |th2|) > 0.08 rad)
+            "q_x": 10.0,
+            "q_dx": 2.0,
+            "q_th1": 2200.0,
+            "q_dth1": 70.0,
+            "q_th2": 2200.0,
+            "q_dth2": 70.0,
+            "r_u": 0.003
         }
     }
 
@@ -166,6 +176,20 @@ class DIPLearner:
             try:
                 with open(self.filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                    # Migrate single-LQR schema to dual-mode schema if necessary
+                    if "lqr_balance" not in data:
+                        data["lqr_balance"] = copy.deepcopy(data.get("lqr", self.DEFAULT_PARAMS["lqr_balance"]))
+                    if "lqr_recovery" not in data:
+                        base = copy.deepcopy(data.get("lqr", self.DEFAULT_PARAMS["lqr_balance"]))
+                        base["q_x"] = 10.0
+                        base["q_dx"] = 2.0
+                        base["q_th1"] = max(base.get("q_th1", 850.0) * 2.2, 2000.0)
+                        base["q_th2"] = max(base.get("q_th2", 850.0) * 2.2, 2000.0)
+                        base["q_dth1"] = max(base.get("q_dth1", 38.0) * 1.8, 65.0)
+                        base["q_dth2"] = max(base.get("q_dth2", 38.0) * 1.8, 65.0)
+                        base["r_u"] = min(base.get("r_u", 0.01) * 0.25, 0.0035)
+                        data["lqr_recovery"] = base
+
                     print(f"[LEARNER] Loaded learned parameters from {os.path.basename(self.filepath)}")
                     print(f"          Best Recorded Mean Score: {data.get('best_mean_score', 0):.1f}/100 | "
                           f"Trained Episodes: {data.get('episodes_trained', 0)}")
@@ -187,12 +211,15 @@ class DIPLearner:
         except Exception as e:
             print(f"[ERROR] Could not save parameters: {e}")
 
-    def get_q_diag(self):
-        lqr = self.params["lqr"]
+    def get_q_diag(self, mode="balance"):
+        key = "lqr_recovery" if mode == "recovery" else "lqr_balance"
+        lqr = self.params.get(key, self.params.get("lqr", self.DEFAULT_PARAMS["lqr_balance"]))
         return [lqr["q_x"], lqr["q_dx"], lqr["q_th1"], lqr["q_dth1"], lqr["q_th2"], lqr["q_dth2"]]
 
-    def get_r_val(self):
-        return self.params["lqr"].get("r_u", 0.01)
+    def get_r_val(self, mode="balance"):
+        key = "lqr_recovery" if mode == "recovery" else "lqr_balance"
+        lqr = self.params.get(key, self.params.get("lqr", self.DEFAULT_PARAMS["lqr_balance"]))
+        return lqr.get("r_u", 0.01)
 
     def get_swing_param(self, key):
         return self.params["swingup"][key]
@@ -233,6 +260,15 @@ def evaluate_trial(model, data, K, swing_params, init_pos, duration=10.0):
     scores = []
     caught = False
     u_max = 60.0
+
+    if isinstance(K, dict):
+        K_bal = K["balance"]
+        K_rec = K["recovery"]
+    elif isinstance(K, (list, tuple)) and len(K) == 2:
+        K_bal, K_rec = K[0], K[1]
+    else:
+        K_bal = K
+        K_rec = K
 
     omega = swing_params["omega_pump"]
     A0 = swing_params["amp_pump"]
@@ -287,19 +323,30 @@ def evaluate_trial(model, data, K, swing_params, init_pos, duration=10.0):
             # Reset streak if balance breaks below perfect threshold
             current_streak = 0.0
 
-        # 2. Cart Drift Penalty: softened penalty, only heavily penalizes when nearing track limits (|x| > 1.8m)
-        cart_drift = 0.1 * (x / 1.0)**2 + 0.05 * (dx / 1.0)**2
-        if abs(x) > 1.8:
-            cart_drift += 5.0 * (abs(x) - 1.8)
-        total_drift_penalty += cart_drift * dt
-
         th1_deg = np.degrees(th1)
         th2_deg = np.degrees(th2)
         q2_deg = np.degrees(q2)
 
-        # 3. Micro-Oscillation Penalty: suppress high-frequency angular jitter when near vertical (softened 50%)
-        if abs(th1_deg) < 15.0 and abs(th2_deg) < 15.0:
-            total_micro_osc_penalty += 0.5 * (dth1**2 + dth2**2) * dt
+        # Dual-Mode Controller Logic (Gain Scheduling):
+        # Recovery Mode: max(|th1|, |th2|) > 0.08 rad (~4.58 deg)
+        # Balance Mode: max(|th1|, |th2|) <= 0.08 rad
+        max_th_abs = max(abs(th1), abs(th2))
+        is_recovery = (max_th_abs > 0.08)
+
+        if not is_recovery:
+            # Balance Mode: heavily penalize cart displacement from track center and micro-oscillations
+            cart_drift = 0.5 * (x / 0.5)**2 + 0.1 * (dx / 0.5)**2
+            if abs(x) > 1.4:
+                cart_drift += 5.0 * (abs(x) - 1.4)
+            total_drift_penalty += cart_drift * dt
+
+            # Suppress micro-oscillations near vertical
+            total_micro_osc_penalty += (dth1**2 + dth2**2) * dt
+        else:
+            # Recovery Mode: IGNORE cart drift and micro-oscillation penalties
+            # Only penalize severe danger of rail collision (|x| > 2.0m)
+            if abs(x) > 2.0:
+                total_drift_penalty += 10.0 * (abs(x) - 2.0) * dt
 
         # Early termination checks to maximize compute efficiency:
         # 1. Cart hits rail stop (|x| > 2.15m) -> physical crash, unrecoverable
@@ -310,7 +357,8 @@ def evaluate_trial(model, data, K, swing_params, init_pos, duration=10.0):
             break
 
         z = np.array([x, dx, th1, dth1, th2, dth2])
-        u_lqr = - float((K @ z)[0])
+        K_active = K_rec if is_recovery else K_bal
+        u_lqr = - float((K_active @ z)[0])
 
         E = compute_pendulum_energy(th1, dth1, th2, dth2)
         alpha = np.clip((E_UPRIGHT - E) / (2.0 * E_UPRIGHT), 0.05, 1.0)

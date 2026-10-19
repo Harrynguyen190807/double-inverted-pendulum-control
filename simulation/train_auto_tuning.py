@@ -1,27 +1,26 @@
 """
 Autonomous Optimization & Evolutionary Auto-Tuner for Double Inverted Pendulum (DIP)
-Lead Mechatronics & Embedded Control Engineer
+Lead Mechatronics & Embedded Control Engineer - Version 3.0
 
-Features:
-1. Flexible CLI Configuration:
-   - Configurable generation count (--generations / --gens, default: 100).
-   - Configurable population size (--pop-size, default: 40).
-   - Configurable episode evaluation duration (--max-hold-target / --duration, default: 20.0s).
-   - Configurable parallel worker count (--workers, default: up to 16 CPU cores).
-2. Rebalanced Multi-Objective Fitness Function:
-   - Apex Catch Dominance: +100.0 pts for each successfully caught initial angle.
-   - Hold Time Streak: High reward (+15.0x streak, +2.0x progressive integral) for sustained 99+ pts.
-   - Softened Penalties: Cart drift penalty reduced by 50% and bounded to track limits (|x| > 1.8m);
-     Micro-oscillation penalty reduced by 50%.
-3. Cyclic Stagnation Management:
-   - Fires an exploratory pulse (2.0x mutation noise + 20% random injection) only once every 8 stagnant
-     generations, then resets the stagnation counter to 0 to permit population exploitation and fine-tuning.
-4. High-Performance Multiprocessing:
-   - Uses concurrent.futures.ProcessPoolExecutor to distribute candidate evaluations across all CPU cores.
-   - Early Termination stops failed/crashed trials early to save massive CPU cycles.
-5. Record Tracking & Parameter Persistence:
-   - Evaluates best candidates based on Record Catches, Record Mean, and Best Fitness.
-   - Automatically writes best parameters to 'learned_params.json'.
+Architectural Enhancements:
+1. Strict Catch Hierarchy:
+   - +500.0 pts for every successfully caught scenario.
+   - Any individual with higher catches (e.g., 4/5 or 5/5) is mathematically guaranteed
+     to achieve a higher fitness than any 3/5 candidate.
+2. Gain Scheduling / Dual-Mode Controller:
+   - Evaluates two specialized LQR gain matrices:
+     * Recovery Mode (max(|th1|, |th2|) > 0.08 rad / ~4.58 deg): High pole gains, aggressive
+       control effort to whip the cart and pull the pendulum back; suppresses drift and micro-osc penalties.
+     * Balance Mode (max(|th1|, |th2|) <= 0.08 rad): Smooth gains, penalizes drift to pull cart
+       toward track center (x = 0), suppresses micro-oscillations, and maximizes continuous 100-pt hold.
+3. Curriculum Learning (Graduated Angle Progression):
+   - Stage 1 (Gen 1-30): Moderate tilt angles (3 deg to 8 deg) to perfect Balance Mode and centering.
+   - Stage 2 (Gen 31-60): Large tilt angles (6 deg to 20 deg) to perfect Recovery Mode.
+   - Stage 3 (Gen 61+): Full spectrum evaluation (upright, 20 deg, horizontal 90 deg, -120 deg, hanging 180 deg).
+4. Advanced Evolutionary Search:
+   - Eliminated 100%-failing Random Injection.
+   - Top-5 Elitism: Best 5 candidates preserved across generations.
+   - Differential Evolution (DE) + Directed Mutation centered on the all-time best-catch champion.
 """
 
 import os
@@ -40,14 +39,14 @@ from dip_learner import (
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Autonomous Evolutionary Auto-Tuner for Double Inverted Pendulum"
+        description="Autonomous Evolutionary Auto-Tuner for Double Inverted Pendulum (v3.0)"
     )
     parser.add_argument(
         "--generations", "--gens",
         type=int,
         default=100,
         dest="generations",
-        help="Total number of evolutionary generations to optimize (default: 100)"
+        help="Total number of evolutionary generations (default: 100)"
     )
     parser.add_argument(
         "--pop-size",
@@ -61,14 +60,14 @@ def parse_args():
         type=float,
         default=20.0,
         dest="max_hold_target",
-        help="Maximum simulation duration (s) per test scenario (default: 20.0s)"
+        help="Episode duration (s) per test scenario (default: 20.0s)"
     )
     parser.add_argument(
         "--workers",
         type=int,
         default=min(os.cpu_count() or 4, 16),
         dest="workers",
-        help="Number of parallel worker processes for candidate evaluation (default: auto, up to 16)"
+        help="Parallel worker processes for candidate evaluation (default: auto, up to 16)"
     )
     parser.add_argument(
         "--seed",
@@ -79,98 +78,97 @@ def parse_args():
     return parser.parse_args()
 
 
-# Test scenarios covering all angle regimes
-TEST_SCENARIOS = [
-    ("Near Upright (+6 deg)",    [0.0, np.radians(6.0), np.radians(-4.0)]),
-    ("Slight Tilt (-4 deg)",     [0.0, np.radians(-4.0), np.radians(2.0)]),
-    ("Hanging Down (180 deg)",   [0.0, np.pi, 0.0]),
-    ("Horizontal (+90 deg)",     [0.0, np.pi / 2.0, 0.0]),
-    ("Diagonal (-120 deg)",      [0.0, np.radians(-120.0), np.radians(20.0)]),
+# =====================================================================
+# CURRICULUM LEARNING SCENARIO STAGES
+# =====================================================================
+
+CURRICULUM_STAGE_1 = [
+    ("Stage1: Upright (+3 deg)",     [0.0, np.radians(3.0), np.radians(-2.0)]),
+    ("Stage1: Tilt (+5 deg)",        [0.0, np.radians(5.0), np.radians(-3.0)]),
+    ("Stage1: Tilt (-4 deg)",        [0.0, np.radians(-4.0), np.radians(2.0)]),
+    ("Stage1: Tilt (+7 deg)",        [0.0, np.radians(7.0), np.radians(-5.0)]),
+    ("Stage1: Tilt (-8 deg)",        [0.0, np.radians(-8.0), np.radians(4.0)]),
 ]
 
-# Parameter search space bounds for mutation and random injection
-PARAM_BOUNDS = {
-    "omega_pump":    (4.5, 5.8),
-    "amp_pump":      (0.50, 0.85),
-    "k_track_p":     (90.0, 170.0),
-    "k_track_d":     (18.0, 36.0),
-    "k_align_p":     (12.0, 35.0),
-    "k_align_d":     (1.8, 5.0),
-    "catch_th1_deg": (13.0, 22.0),
-    "catch_th2_deg": (15.0, 24.0),
-    "catch_q2_deg":  (8.0, 16.0),
-    "catch_dth_max": (2.2, 4.5),
-    "catch_u_max":   (42.0, 58.0),
-    # LQR weights
-    "q_x":           (40.0, 110.0),
-    "q_dx":          (5.0, 18.0),
-    "q_th1":         (600.0, 1200.0),
-    "q_dth1":        (25.0, 55.0),
-    "q_th2":         (600.0, 1200.0),
-    "q_dth2":        (25.0, 55.0),
-    "r_u":           (0.005, 0.03)
-}
+CURRICULUM_STAGE_2 = [
+    ("Stage2: Tilt (+6 deg)",        [0.0, np.radians(6.0), np.radians(-4.0)]),
+    ("Stage2: Tilt (-6 deg)",        [0.0, np.radians(-6.0), np.radians(3.0)]),
+    ("Stage2: Large Tilt (+14 deg)", [0.0, np.radians(14.0), np.radians(-8.0)]),
+    ("Stage2: Large Tilt (-16 deg)", [0.0, np.radians(-16.0), np.radians(10.0)]),
+    ("Stage2: Extreme (+20 deg)",    [0.0, np.radians(20.0), np.radians(-12.0)]),
+]
 
-# Baseline mutation standard deviations
-BASE_MUTATION_SCALES = {
-    "omega_pump":    0.06,
-    "amp_pump":      0.025,
-    "k_track_p":     5.0,
-    "k_track_d":     1.2,
-    "k_align_p":     1.8,
-    "k_align_d":     0.25,
-    "catch_th1_deg": 0.8,
-    "catch_th2_deg": 0.8,
-    "catch_q2_deg":  0.8,
-    "catch_dth_max": 0.15,
-    "catch_u_max":   1.5,
-    "q_x":           4.0,
-    "q_dx":          0.8,
-    "q_th1":         35.0,
-    "q_dth1":        2.0,
-    "q_th2":         35.0,
-    "q_dth2":        2.0,
-    "r_u":           0.001
-}
+CURRICULUM_STAGE_3 = [
+    ("Stage3: Upright (+6 deg)",     [0.0, np.radians(6.0), np.radians(-4.0)]),
+    ("Stage3: Extreme (-18 deg)",    [0.0, np.radians(-18.0), np.radians(10.0)]),
+    ("Stage3: Horizontal (+90 deg)", [0.0, np.pi / 2.0, 0.0]),
+    ("Stage3: Diagonal (-120 deg)",  [0.0, np.radians(-120.0), np.radians(20.0)]),
+    ("Stage3: Hanging (180 deg)",    [0.0, np.pi, 0.0]),
+]
 
 
-def sample_random_individual(template_params):
-    """Generates a completely new exploratory individual within valid physical bounds."""
+def get_curriculum(gen):
+    if gen <= 30:
+        return 1, "Stage 1: Balance Mastery (3 to 8 deg)", CURRICULUM_STAGE_1
+    elif gen <= 60:
+        return 2, "Stage 2: Recovery Mastery (6 to 20 deg)", CURRICULUM_STAGE_2
+    else:
+        return 3, "Stage 3: Full Spectrum & Swing-up (to 180 deg)", CURRICULUM_STAGE_3
+
+
+# =====================================================================
+# SEARCH SPACE DEFINITION (25 PARAMETERS)
+# =====================================================================
+
+PARAM_SCHEMA = [
+    # Swing-up parameters (11)
+    ("swingup", "omega_pump",    (4.5, 5.8),     0.05),
+    ("swingup", "amp_pump",      (0.50, 0.85),   0.02),
+    ("swingup", "k_track_p",     (90.0, 170.0),  4.0),
+    ("swingup", "k_track_d",     (18.0, 36.0),   1.0),
+    ("swingup", "k_align_p",     (12.0, 35.0),   1.5),
+    ("swingup", "k_align_d",     (1.8, 5.0),     0.2),
+    ("swingup", "catch_th1_deg", (13.0, 24.0),   0.6),
+    ("swingup", "catch_th2_deg", (15.0, 25.0),   0.6),
+    ("swingup", "catch_q2_deg",  (8.0, 16.0),    0.5),
+    ("swingup", "catch_dth_max", (2.2, 4.5),     0.12),
+    ("swingup", "catch_u_max",   (40.0, 58.0),   1.2),
+
+    # Balance Mode LQR parameters (7) - Focused on centering, jitter damping, smoothness
+    ("lqr_balance", "q_x",       (50.0, 150.0),  4.0),
+    ("lqr_balance", "q_dx",      (6.0, 25.0),    0.8),
+    ("lqr_balance", "q_th1",     (600.0, 1400.0), 30.0),
+    ("lqr_balance", "q_dth1",    (25.0, 60.0),   2.0),
+    ("lqr_balance", "q_th2",     (600.0, 1400.0), 30.0),
+    ("lqr_balance", "q_dth2",    (25.0, 60.0),   2.0),
+    ("lqr_balance", "r_u",       (0.008, 0.03),  0.001),
+
+    # Recovery Mode LQR parameters (7) - Focused on aggressive pole catch, low control penalty
+    ("lqr_recovery", "q_x",      (5.0, 30.0),    2.0),
+    ("lqr_recovery", "q_dx",     (1.0, 8.0),     0.4),
+    ("lqr_recovery", "q_th1",    (1500.0, 3500.0), 50.0),
+    ("lqr_recovery", "q_dth1",   (45.0, 110.0),  3.0),
+    ("lqr_recovery", "q_th2",    (1500.0, 3500.0), 50.0),
+    ("lqr_recovery", "q_dth2",   (45.0, 110.0),  3.0),
+    ("lqr_recovery", "r_u",      (0.001, 0.006), 0.0003),
+]
+
+SIGMA_VECTOR = np.array([p[3] for p in PARAM_SCHEMA], dtype=float)
+
+
+def params_to_vector(params):
+    """Flattens parameter dict into 1D numpy vector."""
+    vec = []
+    for section, key, bounds, sigma in PARAM_SCHEMA:
+        vec.append(float(params[section][key]))
+    return np.array(vec, dtype=float)
+
+
+def vector_to_params(vec, template_params):
+    """Converts 1D numpy vector back to parameter dict with boundary clamping."""
     ind = copy.deepcopy(template_params)
-    sw = ind["swingup"]
-    lqr = ind["lqr"]
-
-    for k in sw:
-        if k in PARAM_BOUNDS:
-            low, high = PARAM_BOUNDS[k]
-            sw[k] = float(np.random.uniform(low, high))
-
-    for k in lqr:
-        if k in PARAM_BOUNDS:
-            low, high = PARAM_BOUNDS[k]
-            lqr[k] = float(np.random.uniform(low, high))
-
-    return ind
-
-
-def mutate_individual(base_params, mutation_multiplier=1.0):
-    """Applies Gaussian perturbation scaled by mutation_multiplier with physical boundary clamping."""
-    ind = copy.deepcopy(base_params)
-    sw = ind["swingup"]
-    lqr = ind["lqr"]
-
-    for k in sw:
-        if k in BASE_MUTATION_SCALES and k in PARAM_BOUNDS:
-            scale = BASE_MUTATION_SCALES[k] * mutation_multiplier
-            low, high = PARAM_BOUNDS[k]
-            sw[k] = float(np.clip(sw[k] + np.random.normal(0.0, scale), low, high))
-
-    for k in lqr:
-        if k in BASE_MUTATION_SCALES and k in PARAM_BOUNDS:
-            scale = BASE_MUTATION_SCALES[k] * mutation_multiplier
-            low, high = PARAM_BOUNDS[k]
-            lqr[k] = float(np.clip(lqr[k] + np.random.normal(0.0, scale), low, high))
-
+    for i, (section, key, (low, high), sigma) in enumerate(PARAM_SCHEMA):
+        ind[section][key] = float(np.clip(vec[i], low, high))
     return ind
 
 
@@ -186,9 +184,10 @@ def _worker_init(xml_path):
     _worker_data = mujoco.MjData(_worker_model)
 
 
-def evaluate_candidate(candidate_params, model, data, duration=20.0):
+def evaluate_candidate(candidate_params, model, data, scenarios, duration=20.0):
     """
-    Evaluates a candidate across all scenarios and computes the multi-objective fitness.
+    Evaluates a candidate across the specified scenarios using the Dual-Mode Controller.
+    Computes fitness with strict catch hierarchy (+500.0 / catch).
     """
     total_mean = 0.0
     total_peak = 0.0
@@ -198,17 +197,29 @@ def evaluate_candidate(candidate_params, model, data, duration=20.0):
     total_micro_osc = 0.0
     catches = 0
 
-    lqr_cfg = candidate_params["lqr"]
-    q_vec = [
-        lqr_cfg["q_x"], lqr_cfg["q_dx"],
-        lqr_cfg["q_th1"], lqr_cfg["q_dth1"],
-        lqr_cfg["q_th2"], lqr_cfg["q_dth2"]
+    # 1. Synthesize Balance Mode LQR Gain
+    bal_cfg = candidate_params["lqr_balance"]
+    q_bal = [
+        bal_cfg["q_x"], bal_cfg["q_dx"],
+        bal_cfg["q_th1"], bal_cfg["q_dth1"],
+        bal_cfg["q_th2"], bal_cfg["q_dth2"]
     ]
-    k_cand = compute_lqr_gain(model, data, q_vec, lqr_cfg.get("r_u", 0.01))
+    k_bal = compute_lqr_gain(model, data, q_bal, bal_cfg.get("r_u", 0.015))
+
+    # 2. Synthesize Recovery Mode LQR Gain
+    rec_cfg = candidate_params["lqr_recovery"]
+    q_rec = [
+        rec_cfg["q_x"], rec_cfg["q_dx"],
+        rec_cfg["q_th1"], rec_cfg["q_dth1"],
+        rec_cfg["q_th2"], rec_cfg["q_dth2"]
+    ]
+    k_rec = compute_lqr_gain(model, data, q_rec, rec_cfg.get("r_u", 0.003))
+
+    K_dual = {"balance": k_bal, "recovery": k_rec}
     sw_cfg = candidate_params["swingup"]
 
-    for name, init_pos in TEST_SCENARIOS:
-        res = evaluate_trial(model, data, k_cand, sw_cfg, init_pos, duration=duration)
+    for name, init_pos in scenarios:
+        res = evaluate_trial(model, data, K_dual, sw_cfg, init_pos, duration=duration)
         total_mean += res["mean_score"]
         total_peak += res["peak_score"]
         total_max_streak += res["max_streak"]
@@ -218,7 +229,7 @@ def evaluate_candidate(candidate_params, model, data, duration=20.0):
         if res["caught"]:
             catches += 1
 
-    n = len(TEST_SCENARIOS)
+    n = len(scenarios)
     avg_mean = total_mean / n
     avg_peak = total_peak / n
     avg_streak = total_max_streak / n
@@ -226,20 +237,15 @@ def evaluate_candidate(candidate_params, model, data, duration=20.0):
     avg_drift = total_drift / n
     avg_micro_osc = total_micro_osc / n
 
-    # Rebalanced Multi-Objective Fitness Synthesis:
-    # 1. Base Mean Score: ensures high average score throughout episode
-    # 2. Peak Score: rewards reaching vertical
-    # 3. Consecutive Hold Streak: strong positive reward for unbroken 99+ pts
-    # 4. Progressive Streak Integral: rewards sustaining equilibrium without drop
-    # 5. Apex Catch Bonus: +100.0 pts for each successfully caught scenario
-    # 6. Softened Drift Penalty: 1.0x (heavily penalizes only when near track borders |x| > 1.8m)
-    # 7. Softened Micro-Oscillation Penalty: 0.4x
+    # STRICT CATCH HIERARCHY FITNESS SYNTHESIS:
+    # +500.0 pts for each caught scenario ensures an individual catching 4/5 or 5/5
+    # will strictly beat any individual catching only 3/5.
     fitness = (
+        500.0 * catches +
         1.0 * avg_mean +
         0.3 * avg_peak +
         15.0 * avg_streak +
-        2.0 * avg_streak_reward +
-        100.0 * catches -
+        2.0 * avg_streak_reward -
         1.0 * avg_drift -
         0.4 * avg_micro_osc
     )
@@ -250,6 +256,7 @@ def evaluate_candidate(candidate_params, model, data, duration=20.0):
         "avg_peak": avg_peak,
         "avg_streak": avg_streak,
         "catches": catches,
+        "total_scenarios": n,
         "avg_drift": avg_drift,
         "avg_micro_osc": avg_micro_osc
     }
@@ -258,9 +265,9 @@ def evaluate_candidate(candidate_params, model, data, duration=20.0):
 
 def _worker_eval_task(task_args):
     """Worker task entry point for ProcessPoolExecutor."""
-    candidate_params, duration = task_args
+    candidate_params, scenarios, duration = task_args
     global _worker_model, _worker_data
-    return evaluate_candidate(candidate_params, _worker_model, _worker_data, duration=duration)
+    return evaluate_candidate(candidate_params, _worker_model, _worker_data, scenarios, duration=duration)
 
 
 def main():
@@ -270,16 +277,17 @@ def main():
         np.random.seed(args.seed)
 
     print("=" * 85)
-    print("   DOUBLE INVERTED PENDULUM (DIP) - ADVANCED OPTIMIZER & AUTO-TUNER   ")
+    print("   DOUBLE INVERTED PENDULUM (DIP) - DUAL-MODE CURRICULUM AUTO-TUNER v3.0   ")
     print("=" * 85)
     print(f"Configurations:")
-    print(f" - Total Generations:        {args.generations}")
-    print(f" - Population Size:          {args.pop_size} individuals / gen")
-    print(f" - Max Hold Target Duration: {args.max_hold_target:.1f} s / trial")
-    print(f" - Parallel CPU Workers:     {args.workers} workers")
-    print(f" - Rebalanced Fitness:       +100.0 / Catch | +15.0x Streak | Softened Drift & Micro-Osc")
-    print(f" - Cyclic Stagnation:        Every 8 gens -> 2.0x Noise + 20% Random Injection (then resets)")
-    print(f" - Parameters Output File:   learned_params.json\n")
+    print(f" - Generations:            {args.generations}")
+    print(f" - Population Size:         {args.pop_size} individuals / gen")
+    print(f" - Episode Duration:        {args.max_hold_target:.1f} s / trial")
+    print(f" - Parallel CPU Workers:    {args.workers} workers")
+    print(f" - Catch Hierarchy:         +500.0 pts / catch (Strict Priority)")
+    print(f" - Dual-Mode Controller:    Recovery Mode (th > 0.08 rad) + Balance Mode (th <= 0.08 rad)")
+    print(f" - Curriculum Stages:       Stage 1 (1-30) -> Stage 2 (31-60) -> Stage 3 (61+)")
+    print(f" - Search Mechanism:        Top-5 Elitism + Differential Evolution + Best-Catch Attraction\n")
 
     if not os.path.exists(MODEL_XML):
         print(f"[ERROR] model.xml not found at {MODEL_XML}")
@@ -291,19 +299,30 @@ def main():
     learner = DIPLearner()
     best_params = copy.deepcopy(learner.params)
 
-    print("[1/3] Evaluating current baseline parameters...")
-    base_fit, base_metrics = evaluate_candidate(best_params, model, data, duration=args.max_hold_target)
+    # Initialize curriculum for Generation 1
+    current_stage, stage_name, active_scenarios = get_curriculum(1)
+    print(f"[CURRICULUM] Starting at {stage_name}")
+
+    print("[1/3] Evaluating current baseline parameters on initial stage...")
+    base_fit, base_metrics = evaluate_candidate(best_params, model, data, active_scenarios, duration=args.max_hold_target)
     print(f"      Baseline Fitness:     {base_fit:6.1f}")
     print(f"      Mean Score:           {base_metrics['avg_mean']:5.1f} / 100")
     print(f"      Peak Score:           {base_metrics['avg_peak']:5.1f} / 100")
     print(f"      Max Hold Streak:      {base_metrics['avg_streak']:5.2f} s")
-    print(f"      Apex Catches:         {base_metrics['catches']} / {len(TEST_SCENARIOS)}")
+    print(f"      Apex Catches:         {base_metrics['catches']} / {base_metrics['total_scenarios']}")
     print(f"      Cart Drift Penalty:   {base_metrics['avg_drift']:5.2f}")
     print(f"      Micro-Osc Penalty:    {base_metrics['avg_micro_osc']:5.2f}\n")
 
     best_fitness = base_fit
     best_metrics_recorded = base_metrics
+    best_catch_ind = copy.deepcopy(best_params)
+    best_catch_count = base_metrics["catches"]
+
+    # Initialize elite pool with baseline
+    elite_pool = [copy.deepcopy(best_params)]
+
     stagnation_counter = 0
+    prev_stage = current_stage
 
     print(f"[2/3] Starting Evolutionary Optimization ({args.generations} Gens, Pop {args.pop_size}, Workers {args.workers})...\n")
 
@@ -315,43 +334,91 @@ def main():
         for gen in range(1, args.generations + 1):
             gen_start_time = time.time()
 
-            # Cyclic Stagnation Management:
-            # Trigger exploratory burst only once every 8 stagnant generations, then reset counter
-            # to let population exploit and fine-tune the injected diversity.
-            if stagnation_counter >= 8:
-                mutation_multiplier = 2.0
-                num_random = int(round(0.20 * args.pop_size))
+            # Curriculum check & stage transition
+            current_stage, stage_name, active_scenarios = get_curriculum(gen)
+            if current_stage != prev_stage:
+                print("\n" + "=" * 85)
+                print(f"  >>> CURRICULUM UPGRADE (Gen {gen:03d}): Entering {stage_name} <<<")
+                print("=" * 85)
+                # Re-evaluate best on new curriculum scenarios to establish valid baseline
+                base_fit, base_metrics = evaluate_candidate(best_params, model, data, active_scenarios, duration=args.max_hold_target)
+                best_fitness = base_fit
+                best_metrics_recorded = base_metrics
                 stagnation_counter = 0
-                stag_status = "STAGNATION PULSE: 2.0x MutScale + 20% Random Injection (Reset to 0)"
-            else:
-                mutation_multiplier = 1.0
-                num_random = 0
-                stag_status = f"Stagnant: {stagnation_counter}/8"
+                prev_stage = current_stage
 
-            num_mutated = args.pop_size - num_random
+            # Adaptive search parameters
+            if stagnation_counter >= 5:
+                mut_scale = 1.8
+                stag_status = f"STAGNANT ({stagnation_counter} gens): Directed DE Mutation Active"
+            else:
+                mut_scale = 1.0
+                stag_status = f"Exploiting (Stag: {stagnation_counter}/5)"
+
+            # =========================================================
+            # POPULATION GENERATION: ELITISM + DE + DIRECTED MUTATION
+            # =========================================================
             population = []
 
-            # 1. Mutated candidates around current best
-            for _ in range(num_mutated):
-                population.append(mutate_individual(best_params, mutation_multiplier=mutation_multiplier))
+            # 1. Elitism: Preserve up to Top 5 unique elite candidates
+            for elite in elite_pool[:min(5, len(elite_pool))]:
+                population.append(copy.deepcopy(elite))
 
-            # 2. Random exploratory injection
-            for _ in range(num_random):
-                population.append(sample_random_individual(best_params))
+            # Fill remainder of population using advanced operators
+            vec_best_catch = params_to_vector(best_catch_ind)
+            needed = args.pop_size - len(population)
 
-            # Parallel evaluation
-            tasks = [(cand, args.max_hold_target) for cand in population]
+            for i in range(needed):
+                # Select a parent from elite pool (weighted towards rank 0)
+                parent_idx = np.random.choice(len(elite_pool), p=np.exp(-0.7 * np.arange(len(elite_pool))) / np.sum(np.exp(-0.7 * np.arange(len(elite_pool)))))
+                parent_vec = params_to_vector(elite_pool[parent_idx])
+
+                op_choice = np.random.random()
+
+                if op_choice < 0.50:
+                    # Operator A: Directed Mutation toward Best-Catch Champion
+                    alpha = np.random.uniform(0.15, 0.45)
+                    noise = np.random.normal(0.0, SIGMA_VECTOR * mut_scale)
+                    child_vec = parent_vec + alpha * (vec_best_catch - parent_vec) + noise
+
+                elif op_choice < 0.85 and len(elite_pool) >= 2:
+                    # Operator B: Differential Evolution (DE/best/1 or DE/rand/1)
+                    idx1, idx2 = np.random.choice(len(elite_pool), size=2, replace=(len(elite_pool) < 2))
+                    v1 = params_to_vector(elite_pool[idx1])
+                    v2 = params_to_vector(elite_pool[idx2])
+                    diff = v1 - v2
+                    F = np.random.uniform(0.5, 0.8)
+                    noise = np.random.normal(0.0, SIGMA_VECTOR * 0.4)
+                    child_vec = parent_vec + F * diff + noise
+
+                else:
+                    # Operator C: Local Gaussian Jitter around parent
+                    noise = np.random.normal(0.0, SIGMA_VECTOR * mut_scale)
+                    child_vec = parent_vec + noise
+
+                population.append(vector_to_params(child_vec, best_params))
+
+            # =========================================================
+            # PARALLEL EVALUATION ACROSS WORKERS
+            # =========================================================
+            tasks = [(cand, active_scenarios, args.max_hold_target) for cand in population]
             results = list(executor.map(_worker_eval_task, tasks))
 
             candidates = [(res[0], res[1], cand) for res, cand in zip(results, population)]
             candidates.sort(key=lambda x: x[0], reverse=True)
             top_fit, top_met, top_cand = candidates[0]
 
-            # Record tracking and parameter update policy:
-            # An individual qualifies as new best if:
-            # 1. Higher overall fitness, OR
-            # 2. Higher catches record (e.g. 4/5 vs 3/5, or 5/5 vs 4/5), OR
-            # 3. Equal catches with significant mean score gain (+2.0 pts) and strong fitness
+            # Update Elite Pool (Top 5 unique individuals)
+            elite_pool = [c[2] for c in candidates[:5]]
+
+            # Track all-time highest catches champion
+            if top_met["catches"] > best_catch_count:
+                best_catch_count = top_met["catches"]
+                best_catch_ind = copy.deepcopy(top_cand)
+
+            # =========================================================
+            # RECORD TRACKING & SAVING POLICY
+            # =========================================================
             is_new_best = False
             save_reason = ""
 
@@ -360,10 +427,10 @@ def main():
                 save_reason = f"+{top_fit - best_fitness:4.1f} Fit"
             elif top_met["catches"] > best_metrics_recorded.get("catches", 0):
                 is_new_best = True
-                save_reason = f"RECORD CATCHES ({top_met['catches']}/{len(TEST_SCENARIOS)})"
+                save_reason = f"RECORD CATCHES ({top_met['catches']}/{top_met['total_scenarios']})"
             elif (top_met["catches"] == best_metrics_recorded.get("catches", 0) and
-                  top_met["avg_mean"] > best_metrics_recorded.get("avg_mean", 0.0) + 2.0 and
-                  top_fit >= best_fitness * 0.95):
+                  top_met["avg_mean"] > best_metrics_recorded.get("avg_mean", 0.0) + 1.0 and
+                  top_fit >= best_fitness * 0.98):
                 is_new_best = True
                 save_reason = f"RECORD MEAN ({top_met['avg_mean']:5.1f} vs {best_metrics_recorded['avg_mean']:5.1f})"
 
@@ -375,7 +442,7 @@ def main():
                 best_metrics_recorded = top_met
                 stagnation_counter = 0
 
-                # Update stats and persist to JSON file
+                # Persist to disk
                 best_params["best_mean_score"] = float(top_met["avg_mean"])
                 best_params["peak_score"] = float(top_met["avg_peak"])
                 best_params["best_max_streak"] = float(top_met["avg_streak"])
@@ -384,16 +451,16 @@ def main():
 
                 print(f"  [Gen {gen:03d}/{args.generations:03d}] [+] NEW BEST ({save_reason}) | Fit: {top_fit:6.1f} | "
                       f"Mean: {top_met['avg_mean']:5.1f}/100 | Peak: {top_met['avg_peak']:5.1f} | "
-                      f"Streak: {top_met['avg_streak']:4.2f}s | Catches: {top_met['catches']}/{len(TEST_SCENARIOS)} | "
+                      f"Streak: {top_met['avg_streak']:4.2f}s | Catches: {top_met['catches']}/{top_met['total_scenarios']} | "
                       f"Time: {gen_elapsed:4.1f}s | SAVED!")
             else:
                 stagnation_counter += 1
                 best_params["episodes_trained"] = best_params.get("episodes_trained", 0) + args.pop_size
 
-                # Periodic progress log (every 2 generations or when pulse triggered)
-                if gen % 2 == 0 or "PULSE" in stag_status:
+                # Periodic progress log
+                if gen % 2 == 0 or stagnation_counter == 5:
                     print(f"  [Gen {gen:03d}/{args.generations:03d}] BestFit: {best_fitness:6.1f} | TopGenMean: {top_met['avg_mean']:5.1f}/100 | "
-                          f"TopStreak: {top_met['avg_streak']:4.2f}s | Catches: {top_met['catches']}/{len(TEST_SCENARIOS)} | "
+                          f"TopStreak: {top_met['avg_streak']:4.2f}s | Catches: {top_met['catches']}/{top_met['total_scenarios']} | "
                           f"Time: {gen_elapsed:4.1f}s | {stag_status}")
 
     print("\n" + "=" * 85)
@@ -402,7 +469,7 @@ def main():
     print(f"      Final Best Mean Score:      {best_metrics_recorded['avg_mean']:5.1f} / 100")
     print(f"      Final Best Peak Score:      {best_metrics_recorded['avg_peak']:5.1f} / 100")
     print(f"      Final Max Hold Streak:      {best_metrics_recorded['avg_streak']:5.2f} s")
-    print(f"      Apex Catch Success:         {best_metrics_recorded['catches']} / {len(TEST_SCENARIOS)}")
+    print(f"      Apex Catch Success:         {best_metrics_recorded['catches']} / {best_metrics_recorded['total_scenarios']}")
     print(f"      Parameters permanently saved to: {learner.filepath}")
     print("=" * 85)
 

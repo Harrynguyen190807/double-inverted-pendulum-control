@@ -124,13 +124,18 @@ def main():
     q_diag = learner.get_q_diag()
     r_val = learner.get_r_val()
 
-    print(f"[1/3] Synthesizing LQR Balancer from Learned Parameters:")
-    print(f"      Q_diag = {q_diag}, R = {r_val}")
-    K = compute_lqr_gain(model, data, q_diag, r_val)
-    k_vec = K.flatten()
-    print(f"      Gains K = [x:{k_vec[0]:.1f}, dx:{k_vec[1]:.1f}, "
-          f"th1:{k_vec[2]:.1f}, dth1:{k_vec[3]:.1f}, "
-          f"th2:{k_vec[4]:.1f}, dth2:{k_vec[5]:.1f}]")
+    print(f"[1/3] Synthesizing Dual-Mode LQR Balancer from Learned Parameters:")
+    q_bal = learner.get_q_diag("balance")
+    r_bal = learner.get_r_val("balance")
+    K_bal = compute_lqr_gain(model, data, q_bal, r_bal)
+    k_vec_b = K_bal.flatten()
+    print(f"      Balance K   = [x:{k_vec_b[0]:.1f}, dx:{k_vec_b[1]:.1f}, th1:{k_vec_b[2]:.1f}, dth1:{k_vec_b[3]:.1f}, th2:{k_vec_b[4]:.1f}, dth2:{k_vec_b[5]:.1f}]")
+
+    q_rec = learner.get_q_diag("recovery")
+    r_rec = learner.get_r_val("recovery")
+    K_rec = compute_lqr_gain(model, data, q_rec, r_rec)
+    k_vec_r = K_rec.flatten()
+    print(f"      Recovery K  = [x:{k_vec_r[0]:.1f}, dx:{k_vec_r[1]:.1f}, th1:{k_vec_r[2]:.1f}, dth1:{k_vec_r[3]:.1f}, th2:{k_vec_r[4]:.1f}, dth2:{k_vec_r[5]:.1f}]")
 
     # 2. Configure initial state
     init_desc = set_initial_state(data, args.init)
@@ -220,9 +225,16 @@ def main():
             else:
                 current_streak = 0.0
 
-            # Compute LQR control effort
+            # Compute Dual-Mode LQR control effort (Gain Scheduling)
             z = np.array([x, dx, th1, dth1, th2, dth2])
-            u_lqr = - float((K @ z)[0])
+            max_th_abs = max(abs(th1), abs(th2))
+            if max_th_abs > 0.08:
+                K_active = K_rec
+                lqr_sub = "RECOV"
+            else:
+                K_active = K_bal
+                lqr_sub = "BAL"
+            u_lqr = - float((K_active @ z)[0])
 
             # Transition check: catch and lock balance
             in_catch_basin = (
@@ -288,10 +300,11 @@ def main():
                 duty_cycle = 100.0 * (time_at_100 / max(0.001, elapsed))
                 bar = render_score_bar(score, width=16)
                 
+                mode_str = f"LQR:{lqr_sub}" if mode == "LQR_BALANCE" else "SWING"
                 sys.stdout.write(
                     f"\r{bar} Score:{score:5.1f} | Mean:{mean_score:5.1f} | "
                     f"Streak:{current_streak:4.1f}s(Max:{max_streak:4.1f}s) | "
-                    f"[{mode[:7]:7s}] | Hold:{duty_cycle:4.1f}% | "
+                    f"[{mode_str:7s}] | Hold:{duty_cycle:4.1f}% | "
                     f"Recov:{recovery_count:2d} | u:{u_clamped:+5.1f}N | x:{x:+5.2f}m"
                 )
                 sys.stdout.flush()
