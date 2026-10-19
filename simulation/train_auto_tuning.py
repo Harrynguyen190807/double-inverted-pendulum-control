@@ -7,24 +7,29 @@ Features:
    - Configurable generation count (--generations / --gens, default: 100).
    - Configurable population size (--pop-size, default: 40).
    - Configurable episode evaluation duration (--max-hold-target / --duration, default: 20.0s).
-2. Multi-Objective Fitness Function:
-   - Consecutive Hold Reward: Progressive quadratic bonus for unbroken streaks in the 100-point zone (>= 99.0).
-   - Cart Drift Penalty: Quadratic penalty on displacement from track center (|x|) and cart velocity (|dx|).
-   - Micro-Oscillation Suppression: Penalizes angular velocities (dth1^2 + dth2^2) near upright.
-   - Comprehensive multi-scenario evaluation across diverse initial angles.
-3. Stagnation Detection & Adaptive Mutation:
-   - Tracks stagnation when Best Fitness does not improve for >= 5 consecutive generations.
-   - Automatically doubles mutation noise scale and injects 20% randomized exploratory individuals
-     to escape local minima.
-4. Persistence & Reporting:
+   - Configurable parallel worker count (--workers, default: up to 16 CPU cores).
+2. Rebalanced Multi-Objective Fitness Function:
+   - Apex Catch Dominance: +100.0 pts for each successfully caught initial angle.
+   - Hold Time Streak: High reward (+15.0x streak, +2.0x progressive integral) for sustained 99+ pts.
+   - Softened Penalties: Cart drift penalty reduced by 50% and bounded to track limits (|x| > 1.8m);
+     Micro-oscillation penalty reduced by 50%.
+3. Cyclic Stagnation Management:
+   - Fires an exploratory pulse (2.0x mutation noise + 20% random injection) only once every 8 stagnant
+     generations, then resets the stagnation counter to 0 to permit population exploitation and fine-tuning.
+4. High-Performance Multiprocessing:
+   - Uses concurrent.futures.ProcessPoolExecutor to distribute candidate evaluations across all CPU cores.
+   - Early Termination stops failed/crashed trials early to save massive CPU cycles.
+5. Record Tracking & Parameter Persistence:
+   - Evaluates best candidates based on Record Catches, Record Mean, and Best Fitness.
    - Automatically writes best parameters to 'learned_params.json'.
-   - Detailed progress telemetry logging every generation.
 """
 
 import os
 import sys
 import copy
 import argparse
+import time
+import concurrent.futures
 import numpy as np
 import mujoco
 
@@ -59,6 +64,13 @@ def parse_args():
         help="Maximum simulation duration (s) per test scenario (default: 20.0s)"
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=min(os.cpu_count() or 4, 16),
+        dest="workers",
+        help="Number of parallel worker processes for candidate evaluation (default: auto, up to 16)"
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -66,6 +78,15 @@ def parse_args():
     )
     return parser.parse_args()
 
+
+# Test scenarios covering all angle regimes
+TEST_SCENARIOS = [
+    ("Near Upright (+6 deg)",    [0.0, np.radians(6.0), np.radians(-4.0)]),
+    ("Slight Tilt (-4 deg)",     [0.0, np.radians(-4.0), np.radians(2.0)]),
+    ("Hanging Down (180 deg)",   [0.0, np.pi, 0.0]),
+    ("Horizontal (+90 deg)",     [0.0, np.pi / 2.0, 0.0]),
+    ("Diagonal (-120 deg)",      [0.0, np.radians(-120.0), np.radians(20.0)]),
+]
 
 # Parameter search space bounds for mutation and random injection
 PARAM_BOUNDS = {
@@ -153,6 +174,95 @@ def mutate_individual(base_params, mutation_multiplier=1.0):
     return ind
 
 
+# Worker global caches for ProcessPoolExecutor
+_worker_model = None
+_worker_data = None
+
+
+def _worker_init(xml_path):
+    """Initializes worker process with its own private MuJoCo model and data instances."""
+    global _worker_model, _worker_data
+    _worker_model = mujoco.MjModel.from_xml_path(xml_path)
+    _worker_data = mujoco.MjData(_worker_model)
+
+
+def evaluate_candidate(candidate_params, model, data, duration=20.0):
+    """
+    Evaluates a candidate across all scenarios and computes the multi-objective fitness.
+    """
+    total_mean = 0.0
+    total_peak = 0.0
+    total_max_streak = 0.0
+    total_streak_reward = 0.0
+    total_drift = 0.0
+    total_micro_osc = 0.0
+    catches = 0
+
+    lqr_cfg = candidate_params["lqr"]
+    q_vec = [
+        lqr_cfg["q_x"], lqr_cfg["q_dx"],
+        lqr_cfg["q_th1"], lqr_cfg["q_dth1"],
+        lqr_cfg["q_th2"], lqr_cfg["q_dth2"]
+    ]
+    k_cand = compute_lqr_gain(model, data, q_vec, lqr_cfg.get("r_u", 0.01))
+    sw_cfg = candidate_params["swingup"]
+
+    for name, init_pos in TEST_SCENARIOS:
+        res = evaluate_trial(model, data, k_cand, sw_cfg, init_pos, duration=duration)
+        total_mean += res["mean_score"]
+        total_peak += res["peak_score"]
+        total_max_streak += res["max_streak"]
+        total_streak_reward += res["streak_reward"]
+        total_drift += res["drift_penalty"]
+        total_micro_osc += res["micro_osc_penalty"]
+        if res["caught"]:
+            catches += 1
+
+    n = len(TEST_SCENARIOS)
+    avg_mean = total_mean / n
+    avg_peak = total_peak / n
+    avg_streak = total_max_streak / n
+    avg_streak_reward = total_streak_reward / n
+    avg_drift = total_drift / n
+    avg_micro_osc = total_micro_osc / n
+
+    # Rebalanced Multi-Objective Fitness Synthesis:
+    # 1. Base Mean Score: ensures high average score throughout episode
+    # 2. Peak Score: rewards reaching vertical
+    # 3. Consecutive Hold Streak: strong positive reward for unbroken 99+ pts
+    # 4. Progressive Streak Integral: rewards sustaining equilibrium without drop
+    # 5. Apex Catch Bonus: +100.0 pts for each successfully caught scenario
+    # 6. Softened Drift Penalty: 1.0x (heavily penalizes only when near track borders |x| > 1.8m)
+    # 7. Softened Micro-Oscillation Penalty: 0.4x
+    fitness = (
+        1.0 * avg_mean +
+        0.3 * avg_peak +
+        15.0 * avg_streak +
+        2.0 * avg_streak_reward +
+        100.0 * catches -
+        1.0 * avg_drift -
+        0.4 * avg_micro_osc
+    )
+
+    metrics = {
+        "fitness": fitness,
+        "avg_mean": avg_mean,
+        "avg_peak": avg_peak,
+        "avg_streak": avg_streak,
+        "catches": catches,
+        "avg_drift": avg_drift,
+        "avg_micro_osc": avg_micro_osc
+    }
+    return fitness, metrics
+
+
+def _worker_eval_task(task_args):
+    """Worker task entry point for ProcessPoolExecutor."""
+    candidate_params, duration = task_args
+    global _worker_model, _worker_data
+    return evaluate_candidate(candidate_params, _worker_model, _worker_data, duration=duration)
+
+
 def main():
     args = parse_args()
 
@@ -163,12 +273,13 @@ def main():
     print("   DOUBLE INVERTED PENDULUM (DIP) - ADVANCED OPTIMIZER & AUTO-TUNER   ")
     print("=" * 85)
     print(f"Configurations:")
-    print(f" • Total Generations:        {args.generations}")
-    print(f" • Population Size:          {args.pop_size} individuals / gen")
-    print(f" • Max Hold Target Duration: {args.max_hold_target:.1f} s / trial")
-    print(f" • Multi-Objective Reward:   Consecutive Hold Streak + Cart Center Guard + Low Jitter")
-    print(f" • Adaptive Mutation:        5-Gen Stagnation Detection -> 2.0x Noise + 20% Random Injection")
-    print(f" • Parameters Output File:   learned_params.json\n")
+    print(f" - Total Generations:        {args.generations}")
+    print(f" - Population Size:          {args.pop_size} individuals / gen")
+    print(f" - Max Hold Target Duration: {args.max_hold_target:.1f} s / trial")
+    print(f" - Parallel CPU Workers:     {args.workers} workers")
+    print(f" - Rebalanced Fitness:       +100.0 / Catch | +15.0x Streak | Softened Drift & Micro-Osc")
+    print(f" - Cyclic Stagnation:        Every 8 gens -> 2.0x Noise + 20% Random Injection (then resets)")
+    print(f" - Parameters Output File:   learned_params.json\n")
 
     if not os.path.exists(MODEL_XML):
         print(f"[ERROR] model.xml not found at {MODEL_XML}")
@@ -180,163 +291,110 @@ def main():
     learner = DIPLearner()
     best_params = copy.deepcopy(learner.params)
 
-    # Suite of challenging test scenarios covering all angle regimes:
-    test_scenarios = [
-        ("Near Upright (+6 deg)",    [0.0, np.radians(6.0), np.radians(-4.0)]),
-        ("Slight Tilt (-4 deg)",     [0.0, np.radians(-4.0), np.radians(2.0)]),
-        ("Hanging Down (180 deg)",   [0.0, np.pi, 0.0]),
-        ("Horizontal (+90 deg)",     [0.0, np.pi / 2.0, 0.0]),
-        ("Diagonal (-120 deg)",      [0.0, np.radians(-120.0), np.radians(20.0)]),
-    ]
-
-    def evaluate_candidate(candidate_params):
-        """
-        Evaluates a candidate across all scenarios and computes the multi-objective fitness.
-        """
-        total_mean = 0.0
-        total_peak = 0.0
-        total_max_streak = 0.0
-        total_streak_reward = 0.0
-        total_drift = 0.0
-        total_micro_osc = 0.0
-        catches = 0
-
-        lqr_cfg = candidate_params["lqr"]
-        q_vec = [
-            lqr_cfg["q_x"], lqr_cfg["q_dx"],
-            lqr_cfg["q_th1"], lqr_cfg["q_dth1"],
-            lqr_cfg["q_th2"], lqr_cfg["q_dth2"]
-        ]
-        k_cand = compute_lqr_gain(model, data, q_vec, lqr_cfg.get("r_u", 0.01))
-        sw_cfg = candidate_params["swingup"]
-
-        for name, init_pos in test_scenarios:
-            res = evaluate_trial(model, data, k_cand, sw_cfg, init_pos, duration=args.max_hold_target)
-            total_mean += res["mean_score"]
-            total_peak += res["peak_score"]
-            total_max_streak += res["max_streak"]
-            total_streak_reward += res["streak_reward"]
-            total_drift += res["drift_penalty"]
-            total_micro_osc += res["micro_osc_penalty"]
-            if res["caught"]:
-                catches += 1
-
-        n = len(test_scenarios)
-        avg_mean = total_mean / n
-        avg_peak = total_peak / n
-        avg_streak = total_max_streak / n
-        avg_streak_reward = total_streak_reward / n
-        avg_drift = total_drift / n
-        avg_micro_osc = total_micro_osc / n
-
-        # Multi-Objective Fitness Synthesis:
-        # 1. Base Mean Score: ensures high average score throughout episode
-        # 2. Peak Score: rewards reaching vertical
-        # 3. Consecutive Hold Streak: strong positive slope for maintaining unbroken 99+ pts
-        # 4. Progressive Streak Integral: rewards sustaining equilibrium without any drop
-        # 5. Catch Bonus: rewards successfully executing the apex transition
-        # 6. Cart Drift Penalty: heavily penalizes moving away from x=0
-        # 7. Micro-Oscillation Penalty: eliminates limit cycles and chattering
-        fitness = (
-            1.0 * avg_mean +
-            0.3 * avg_peak +
-            14.0 * avg_streak +
-            1.5 * avg_streak_reward +
-            25.0 * catches -
-            2.0 * avg_drift -
-            0.8 * avg_micro_osc
-        )
-
-        metrics = {
-            "fitness": fitness,
-            "avg_mean": avg_mean,
-            "avg_peak": avg_peak,
-            "avg_streak": avg_streak,
-            "catches": catches,
-            "avg_drift": avg_drift,
-            "avg_micro_osc": avg_micro_osc
-        }
-        return fitness, metrics
-
     print("[1/3] Evaluating current baseline parameters...")
-    base_fit, base_metrics = evaluate_candidate(best_params)
+    base_fit, base_metrics = evaluate_candidate(best_params, model, data, duration=args.max_hold_target)
     print(f"      Baseline Fitness:     {base_fit:6.1f}")
     print(f"      Mean Score:           {base_metrics['avg_mean']:5.1f} / 100")
     print(f"      Peak Score:           {base_metrics['avg_peak']:5.1f} / 100")
     print(f"      Max Hold Streak:      {base_metrics['avg_streak']:5.2f} s")
-    print(f"      Apex Catches:         {base_metrics['catches']} / {len(test_scenarios)}")
+    print(f"      Apex Catches:         {base_metrics['catches']} / {len(TEST_SCENARIOS)}")
     print(f"      Cart Drift Penalty:   {base_metrics['avg_drift']:5.2f}")
     print(f"      Micro-Osc Penalty:    {base_metrics['avg_micro_osc']:5.2f}\n")
 
     best_fitness = base_fit
     best_metrics_recorded = base_metrics
     stagnation_counter = 0
-    mutation_multiplier = 1.0
 
-    print(f"[2/3] Starting Evolutionary Optimization ({args.generations} Generations, Pop Size {args.pop_size})...\n")
+    print(f"[2/3] Starting Evolutionary Optimization ({args.generations} Gens, Pop {args.pop_size}, Workers {args.workers})...\n")
 
-    for gen in range(1, args.generations + 1):
-        candidates = []
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=args.workers,
+        initializer=_worker_init,
+        initargs=(MODEL_XML,)
+    ) as executor:
+        for gen in range(1, args.generations + 1):
+            gen_start_time = time.time()
 
-        # Determine population composition:
-        # If stagnant >= 5 generations: inject 20% random individuals to escape local minimum
-        num_random = int(round(0.20 * args.pop_size)) if stagnation_counter >= 5 else 0
-        num_mutated = args.pop_size - num_random
-
-        # 1. Mutated candidates around current best
-        for _ in range(num_mutated):
-            cand = mutate_individual(best_params, mutation_multiplier=mutation_multiplier)
-            fit, met = evaluate_candidate(cand)
-            candidates.append((fit, met, cand))
-
-        # 2. Random exploratory injection
-        for _ in range(num_random):
-            cand = sample_random_individual(best_params)
-            fit, met = evaluate_candidate(cand)
-            candidates.append((fit, met, cand))
-
-        # Sort candidates descending by fitness
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        top_fit, top_met, top_cand = candidates[0]
-
-        # Check for improvement
-        if top_fit > best_fitness:
-            improvement = top_fit - best_fitness
-            best_fitness = top_fit
-            best_params = top_cand
-            best_metrics_recorded = top_met
-
-            # Reset stagnation & mutation scale
-            stagnation_counter = 0
-            mutation_multiplier = 1.0
-
-            # Update stats and persist to JSON file
-            best_params["best_mean_score"] = float(top_met["avg_mean"])
-            best_params["peak_score"] = float(top_met["avg_peak"])
-            best_params["best_max_streak"] = float(top_met["avg_streak"])
-            best_params["episodes_trained"] = best_params.get("episodes_trained", 0) + args.pop_size
-            learner.save(best_params)
-
-            print(f"  [Gen {gen:03d}/{args.generations:03d}] [+] NEW BEST FIT: {top_fit:6.1f} (+{improvement:4.1f}) | "
-                  f"Mean: {top_met['avg_mean']:5.1f}/100 | Peak: {top_met['avg_peak']:5.1f} | "
-                  f"Streak: {top_met['avg_streak']:4.2f}s | Catches: {top_met['catches']}/{len(test_scenarios)} | "
-                  f"MutScale: {mutation_multiplier:.1f}x | SAVED!")
-        else:
-            stagnation_counter += 1
-            best_params["episodes_trained"] = best_params.get("episodes_trained", 0) + args.pop_size
-
-            # Stagnation detection check
-            if stagnation_counter >= 5:
+            # Cyclic Stagnation Management:
+            # Trigger exploratory burst only once every 8 stagnant generations, then reset counter
+            # to let population exploit and fine-tune the injected diversity.
+            if stagnation_counter >= 8:
                 mutation_multiplier = 2.0
-                stag_msg = f"-> STAGNATION DETECTED ({stagnation_counter} gens): Boosted MutScale=2.0x, 20% Random Injection"
+                num_random = int(round(0.20 * args.pop_size))
+                stagnation_counter = 0
+                stag_status = "STAGNATION PULSE: 2.0x MutScale + 20% Random Injection (Reset to 0)"
             else:
                 mutation_multiplier = 1.0
-                stag_msg = f"(Stagnant: {stagnation_counter}/5)"
+                num_random = 0
+                stag_status = f"Stagnant: {stagnation_counter}/8"
 
-            # Print periodic progress log every 2 generations (or when stagnant)
-            if gen % 2 == 0 or stagnation_counter == 5:
-                print(f"  [Gen {gen:03d}/{args.generations:03d}] BestFit: {best_fitness:6.1f} | TopGenMean: {top_met['avg_mean']:5.1f}/100 | "
-                      f"TopStreak: {top_met['avg_streak']:4.2f}s | Catches: {top_met['catches']}/{len(test_scenarios)} | {stag_msg}")
+            num_mutated = args.pop_size - num_random
+            population = []
+
+            # 1. Mutated candidates around current best
+            for _ in range(num_mutated):
+                population.append(mutate_individual(best_params, mutation_multiplier=mutation_multiplier))
+
+            # 2. Random exploratory injection
+            for _ in range(num_random):
+                population.append(sample_random_individual(best_params))
+
+            # Parallel evaluation
+            tasks = [(cand, args.max_hold_target) for cand in population]
+            results = list(executor.map(_worker_eval_task, tasks))
+
+            candidates = [(res[0], res[1], cand) for res, cand in zip(results, population)]
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            top_fit, top_met, top_cand = candidates[0]
+
+            # Record tracking and parameter update policy:
+            # An individual qualifies as new best if:
+            # 1. Higher overall fitness, OR
+            # 2. Higher catches record (e.g. 4/5 vs 3/5, or 5/5 vs 4/5), OR
+            # 3. Equal catches with significant mean score gain (+2.0 pts) and strong fitness
+            is_new_best = False
+            save_reason = ""
+
+            if top_fit > best_fitness:
+                is_new_best = True
+                save_reason = f"+{top_fit - best_fitness:4.1f} Fit"
+            elif top_met["catches"] > best_metrics_recorded.get("catches", 0):
+                is_new_best = True
+                save_reason = f"RECORD CATCHES ({top_met['catches']}/{len(TEST_SCENARIOS)})"
+            elif (top_met["catches"] == best_metrics_recorded.get("catches", 0) and
+                  top_met["avg_mean"] > best_metrics_recorded.get("avg_mean", 0.0) + 2.0 and
+                  top_fit >= best_fitness * 0.95):
+                is_new_best = True
+                save_reason = f"RECORD MEAN ({top_met['avg_mean']:5.1f} vs {best_metrics_recorded['avg_mean']:5.1f})"
+
+            gen_elapsed = time.time() - gen_start_time
+
+            if is_new_best:
+                best_fitness = max(best_fitness, top_fit)
+                best_params = top_cand
+                best_metrics_recorded = top_met
+                stagnation_counter = 0
+
+                # Update stats and persist to JSON file
+                best_params["best_mean_score"] = float(top_met["avg_mean"])
+                best_params["peak_score"] = float(top_met["avg_peak"])
+                best_params["best_max_streak"] = float(top_met["avg_streak"])
+                best_params["episodes_trained"] = best_params.get("episodes_trained", 0) + args.pop_size
+                learner.save(best_params)
+
+                print(f"  [Gen {gen:03d}/{args.generations:03d}] [+] NEW BEST ({save_reason}) | Fit: {top_fit:6.1f} | "
+                      f"Mean: {top_met['avg_mean']:5.1f}/100 | Peak: {top_met['avg_peak']:5.1f} | "
+                      f"Streak: {top_met['avg_streak']:4.2f}s | Catches: {top_met['catches']}/{len(TEST_SCENARIOS)} | "
+                      f"Time: {gen_elapsed:4.1f}s | SAVED!")
+            else:
+                stagnation_counter += 1
+                best_params["episodes_trained"] = best_params.get("episodes_trained", 0) + args.pop_size
+
+                # Periodic progress log (every 2 generations or when pulse triggered)
+                if gen % 2 == 0 or "PULSE" in stag_status:
+                    print(f"  [Gen {gen:03d}/{args.generations:03d}] BestFit: {best_fitness:6.1f} | TopGenMean: {top_met['avg_mean']:5.1f}/100 | "
+                          f"TopStreak: {top_met['avg_streak']:4.2f}s | Catches: {top_met['catches']}/{len(TEST_SCENARIOS)} | "
+                          f"Time: {gen_elapsed:4.1f}s | {stag_status}")
 
     print("\n" + "=" * 85)
     print("[3/3] Evolutionary Optimization Complete!")
@@ -344,7 +402,7 @@ def main():
     print(f"      Final Best Mean Score:      {best_metrics_recorded['avg_mean']:5.1f} / 100")
     print(f"      Final Best Peak Score:      {best_metrics_recorded['avg_peak']:5.1f} / 100")
     print(f"      Final Max Hold Streak:      {best_metrics_recorded['avg_streak']:5.2f} s")
-    print(f"      Apex Catch Success:         {best_metrics_recorded['catches']} / {len(test_scenarios)}")
+    print(f"      Apex Catch Success:         {best_metrics_recorded['catches']} / {len(TEST_SCENARIOS)}")
     print(f"      Parameters permanently saved to: {learner.filepath}")
     print("=" * 85)
 

@@ -287,19 +287,27 @@ def evaluate_trial(model, data, K, swing_params, init_pos, duration=10.0):
             # Reset streak if balance breaks below perfect threshold
             current_streak = 0.0
 
-        # 2. Cart Drift Penalty: heavily penalizes cart drifting away from track center (x = 0)
-        cart_drift = (x / 0.6)**2 + 0.15 * (dx / 0.8)**2
-        if abs(x) > 1.0:
-            cart_drift += 10.0 * (abs(x) - 1.0)
+        # 2. Cart Drift Penalty: softened penalty, only heavily penalizes when nearing track limits (|x| > 1.8m)
+        cart_drift = 0.1 * (x / 1.0)**2 + 0.05 * (dx / 1.0)**2
+        if abs(x) > 1.8:
+            cart_drift += 5.0 * (abs(x) - 1.8)
         total_drift_penalty += cart_drift * dt
 
         th1_deg = np.degrees(th1)
         th2_deg = np.degrees(th2)
         q2_deg = np.degrees(q2)
 
-        # 3. Micro-Oscillation Penalty: suppress high-frequency angular jitter when near vertical
+        # 3. Micro-Oscillation Penalty: suppress high-frequency angular jitter when near vertical (softened 50%)
         if abs(th1_deg) < 15.0 and abs(th2_deg) < 15.0:
-            total_micro_osc_penalty += (dth1**2 + dth2**2) * dt
+            total_micro_osc_penalty += 0.5 * (dth1**2 + dth2**2) * dt
+
+        # Early termination checks to maximize compute efficiency:
+        # 1. Cart hits rail stop (|x| > 2.15m) -> physical crash, unrecoverable
+        if abs(x) > 2.15:
+            break
+        # 2. Post-catch fall: if already caught but subsequently lost balance and dropped past 45 deg
+        if caught and mode == "SWING" and (abs(th1_deg) > 45.0 or abs(th2_deg) > 45.0):
+            break
 
         z = np.array([x, dx, th1, dth1, th2, dth2])
         u_lqr = - float((K @ z)[0])
@@ -342,8 +350,13 @@ def evaluate_trial(model, data, K, swing_params, init_pos, duration=10.0):
         data.ctrl[0] = u
         mujoco.mj_step(model, data)
 
+    # Pad remaining steps if early terminated so mean_score correctly accounts for failure
+    remaining_steps = total_steps - len(scores)
+    if remaining_steps > 0:
+        scores.extend([0.0] * remaining_steps)
+
     mean_score = float(np.mean(scores))
-    peak_score = float(np.max(scores))
+    peak_score = float(np.max(scores)) if len(scores) > 0 else 0.0
     return {
         "mean_score": mean_score,
         "peak_score": peak_score,
@@ -353,5 +366,5 @@ def evaluate_trial(model, data, K, swing_params, init_pos, duration=10.0):
         "drift_penalty": total_drift_penalty,
         "micro_osc_penalty": total_micro_osc_penalty,
         "caught": caught,
-        "final_score": scores[-1]
+        "final_score": scores[-1] if len(scores) > 0 else 0.0
     }
