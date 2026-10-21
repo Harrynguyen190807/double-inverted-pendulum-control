@@ -68,7 +68,10 @@ The generalized coordinate vector is defined as $\mathbf{q} = [x, \theta_1, \the
 - $\theta_1, \theta_2$ are the angular deviations of Link 1 and Link 2 measured from the upright vertical axis ($0^\circ$, positive counter-clockwise).
 
 The full nonlinear equations of motion in standard robotic manipulator form:
-$$\mathbf{M}(\mathbf{q})\ddot{\mathbf{q}} + \mathbf{C}(\mathbf{q}, \dot{\mathbf{q}})\dot{\mathbf{q}} + \mathbf{G}(\mathbf{q}) + \mathbf{D}\dot{\mathbf{q}} = \mathbf{B}_u u$$
+
+$$
+\mathbf{M}(\mathbf{q})\ddot{\mathbf{q}} + \mathbf{C}(\mathbf{q}, \dot{\mathbf{q}})\dot{\mathbf{q}} + \mathbf{G}(\mathbf{q}) + \mathbf{D}\dot{\mathbf{q}} = \mathbf{B}_u u
+$$
 
 where:
 - $\mathbf{M}(\mathbf{q}) \in \mathbb{R}^{3 \times 3}$ is the symmetric, positive-definite generalized inertia matrix.
@@ -79,24 +82,43 @@ where:
 
 ### Linearization Around Vertical Upright Equilibrium
 Expanding about the unstable upright equilibrium $[\mathbf{q}_0, \dot{\mathbf{q}}_0] = [\mathbf{0}, \mathbf{0}]$ using first-order Taylor series yields the continuous state-space representation:
-$$\dot{\mathbf{z}}(t) = \mathbf{A}\mathbf{z}(t) + \mathbf{B}u(t)$$
-with the 6-dimensional state vector $\mathbf{z} = [x, \dot{x}, \theta_1, \dot{\theta}_1, \theta_2, \dot{\theta}_2]^T$.
+
+$$
+\dot{\mathbf{z}}(t) = \mathbf{A}\mathbf{z}(t) + \mathbf{B}u(t)
+$$
+
+with the 6-dimensional state vector $\mathbf{z}(t) = [x, \dot{x}, \theta_1, \dot{\theta}_1, \theta_2, \dot{\theta}_2]^T$.
 
 ### LQR Optimal Synthesis (Bryson's Rule)
-The quadratic cost functional is formulated as:
-$$J = \int_{0}^{\infty} \left( \mathbf{z}(t)^T \mathbf{Q} \mathbf{z}(t) + R u(t)^2 \right) dt$$
+The continuous-time quadratic cost functional is formulated as:
+
+$$
+J = \int_{0}^{\infty} \left( \mathbf{z}(t)^T \mathbf{Q} \mathbf{z}(t) + R u(t)^2 \right) dt
+$$
 
 Using Bryson's rule to balance maximum acceptable state excursions against maximum actuator effort:
-$$Q_{ii} = \frac{1}{(\Delta z_{i,\max})^2}, \quad R = \frac{1}{(u_{\max})^2}$$
+
+$$
+Q_{ii} = \frac{1}{(\Delta z_{i,\max})^2}, \quad R = \frac{1}{(u_{\max})^2}
+$$
 
 Solving the Continuous Algebraic Riccati Equation (CARE):
-$$\mathbf{A}^T \mathbf{P} + \mathbf{P}\mathbf{A} - \mathbf{P}\mathbf{B}R^{-1}\mathbf{B}^T \mathbf{P} + \mathbf{Q} = 0$$
 
-The optimal feedback gain matrix is:
-$$\mathbf{K} = R^{-1}\mathbf{B}^T \mathbf{P} = \begin{bmatrix} k_x & k_{\dot{x}} & k_{\theta_1} & k_{\dot{\theta}_1} & k_{\theta_2} & k_{\dot{\theta}_2} \end{bmatrix}$$
+$$
+\mathbf{A}^T \mathbf{P} + \mathbf{P}\mathbf{A} - \mathbf{P}\mathbf{B}R^{-1}\mathbf{B}^T \mathbf{P} + \mathbf{Q} = \mathbf{0}
+$$
 
-Control law:
-$$u(t) = -\mathbf{K}\mathbf{z}(t)$$
+The optimal state feedback gain matrix $\mathbf{K}$ is:
+
+$$
+\mathbf{K} = R^{-1}\mathbf{B}^T \mathbf{P} = \begin{bmatrix} k_x & k_{\dot{x}} & k_{\theta_1} & k_{\dot{\theta}_1} & k_{\theta_2} & k_{\dot{\theta}_2} \end{bmatrix}
+$$
+
+Real-time closed-loop control law:
+
+$$
+u(t) = -\mathbf{K}\mathbf{z}(t) = -\left(k_x x + k_{\dot{x}} \dot{x} + k_{\theta_1} \theta_1 + k_{\dot{\theta}_1} \dot{\theta}_1 + k_{\theta_2} \theta_2 + k_{\dot{\theta}_2} \dot{\theta}_2\right)
+$$
 
 ---
 
